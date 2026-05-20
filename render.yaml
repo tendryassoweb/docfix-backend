@@ -1,0 +1,45 @@
+# render.yaml — Configuration de déploiement Render
+# Impulse AI — DocFix Backend
+
+services:
+  - type: web
+    name: docfix-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    
+    # Plan Render (adapter selon les besoins)
+    # free     : 512 Mo RAM, sleep après inactivité
+    # starter  : 512 Mo RAM, toujours actif (7$/mois)
+    # standard : 2 Go RAM, recommandé pour LibreOffice (25$/mois)
+    plan: starter
+
+    # Variables d'environnement (à configurer dans le dashboard Render)
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false          # à renseigner manuellement dans Render
+      - key: GEMINI_MODEL
+        value: gemini-1.5-flash
+      - key: ALLOWED_ORIGINS
+        sync: false          # ex: https://votre-app.vercel.app
+      - key: MAX_FILE_SIZE_MB
+        value: "50"
+      - key: JOB_EXPIRY_SECONDS
+        value: "7200"
+      - key: TEMP_DIR
+        value: /tmp/docfix
+      - key: LIBREOFFICE_PATH
+        value: /usr/bin/soffice
+      - key: DEBUG
+        value: "false"
+      - key: PORT
+        value: "8000"
+
+    # Health check
+    healthCheckPath: /health
+
+    # Scaling
+    scaling:
+      minInstances: 1
+      maxInstances: 3
+      targetMemoryPercent: 80
+      targetCPUPercent: 80
