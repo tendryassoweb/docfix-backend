@@ -1,44 +1,47 @@
 """
-processor.py — Moteur de traitement DOCX
-Développé par Impulse AI
-Chaîne complète : nettoyage → IA → styles → TOC → images → pagination → export PDF
+processor.py — Moteur de traitement DOCX v1.2
+Impulse AI — DocFix
+
+Nouveautés :
+- Styles visuels professionnels (couleurs, espacement, alignement)
+- TOC générée ET mise à jour via LibreOffice
+- Titres colorés, filets décoratifs, aspect pro
 """
 
 import asyncio
 import logging
 import subprocess
 import time
+import re
+import os
 from pathlib import Path
-from typing import Optional
 
-import google.generativeai as genai
 from docx import Document
-from docx.shared import Pt, Inches, RGBColor, Cm
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.style import WD_STYLE_TYPE
+from docx.shared import Pt, Cm, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
-import lxml.etree as etree
+from docx.enum.style import WD_STYLE_TYPE
 
 from .config import settings
 from .jobs import job_store
+from .ai_service import analyze_document, AIProvider
 
 logger = logging.getLogger("docfix.processor")
 
-# ── Configuration Gemini ──────────────────────────────────────────────────────
-if settings.GEMINI_API_KEY:
-    genai.configure(api_key=settings.GEMINI_API_KEY)
+# ── Palette pro ───────────────────────────────────────────────────────────────
+COLOR_H1     = RGBColor(0x1F, 0x35, 0x64)  # Bleu marine
+COLOR_H2     = RGBColor(0x2E, 0x74, 0xB5)  # Bleu moyen
+COLOR_H3     = RGBColor(0x40, 0x40, 0x40)  # Gris anthracite
+COLOR_BODY   = RGBColor(0x26, 0x26, 0x26)  # Noir doux
+COLOR_FOOTER = RGBColor(0x80, 0x80, 0x80)  # Gris
+FONT_HEAD    = "Calibri"
+FONT_BODY    = "Calibri"
 
 
-# ── Point d'entrée principal ──────────────────────────────────────────────────
 async def process_document(job_id: str, input_path: Path):
-    """
-    Orchestre toutes les étapes de traitement.
-    Appelé en arrière-plan par FastAPI BackgroundTasks.
-    """
     job = job_store.get(job_id)
     if not job:
-        logger.error(f"Job {job_id} introuvable")
         return
 
     output_docx = settings.TEMP_DIR / f"{job_id}_output.docx"
@@ -46,540 +49,410 @@ async def process_document(job_id: str, input_path: Path):
 
     try:
         job.status = "processing"
-        start_time = time.time()
+        start = time.time()
 
-        # ─ Étape 1 : Upload / réception (déjà fait, on marque done)
         _step_done(job, "upload", 0)
 
-        # ─ Étape 2 : Parsing
-        _step_start(job, "parse", "Analyse du document DOCX…")
+        _step_start(job, "parse", "Analyse du document DOCX...")
         doc = Document(str(input_path))
-        await asyncio.sleep(0)   # yield pour ne pas bloquer la boucle event
+        await asyncio.sleep(0)
         _step_done(job, "parse", 8)
 
-        # ─ Étape 3 : Analyse IA Gemini
-        _step_start(job, "ai", "Analyse IA du contenu…")
-        ai_hints = await _analyze_with_gemini(doc)
+        _step_start(job, "ai", "Analyse IA du contenu...")
+        ai_result = await analyze_document(doc, job_id)
         _step_done(job, "ai", 18)
 
-        # ─ Étape 4 : Nettoyage espaces
-        _step_start(job, "clean", "Nettoyage des espaces et caractères parasites…")
+        _step_start(job, "clean", "Nettoyage des espaces...")
         await asyncio.to_thread(_clean_whitespace, doc)
-        _step_done(job, "clean", 28)
+        _step_done(job, "clean", 26)
 
-        # ─ Étape 5 : Harmonisation polices
-        _step_start(job, "fonts", "Harmonisation des polices…")
+        _step_start(job, "fonts", "Harmonisation des polices...")
         await asyncio.to_thread(_harmonize_fonts, doc)
-        _step_done(job, "fonts", 38)
+        _step_done(job, "fonts", 34)
 
-        # ─ Étape 6 : Détection et marquage des titres
-        _step_start(job, "headings", "Détection des titres…")
-        headings_count = await asyncio.to_thread(_detect_headings, doc, ai_hints)
-        _step_done(job, "headings", 48)
+        _step_start(job, "headings", "Detection des titres...")
+        n_heads = await asyncio.to_thread(_detect_headings, doc, ai_result.data)
+        _step_done(job, "headings", 44)
 
-        # ─ Étape 7 : Application des styles
-        _step_start(job, "styles", "Application des styles Heading…")
-        await asyncio.to_thread(_apply_styles, doc)
-        _step_done(job, "styles", 56)
+        _step_start(job, "styles", "Application des styles et couleurs...")
+        await asyncio.to_thread(_setup_styles, doc)
+        await asyncio.to_thread(_apply_heading_styles, doc)
+        _step_done(job, "styles", 54)
 
-        # ─ Étape 8 : Table des matières
-        _step_start(job, "toc", "Génération de la table des matières…")
-        await asyncio.to_thread(_add_table_of_contents, doc)
-        _step_done(job, "toc", 64)
+        _step_start(job, "toc", "Generation table des matieres...")
+        toc_ok = await asyncio.to_thread(_add_toc, doc)
+        _step_done(job, "toc", 63)
 
-        # ─ Étape 9 : Images
-        _step_start(job, "images", "Redimensionnement et centrage des images…")
-        images_fixed = await asyncio.to_thread(_fix_images, doc)
-        _step_done(job, "images", 72)
+        _step_start(job, "images", "Redimensionnement images...")
+        n_img = await asyncio.to_thread(_fix_images, doc)
+        _step_done(job, "images", 71)
 
-        # ─ Étape 10 : Pagination et pieds de page
-        _step_start(job, "pagination", "Ajout de la pagination…")
+        _step_start(job, "pagination", "Pagination et pieds de page...")
         await asyncio.to_thread(_add_pagination, doc)
-        _step_done(job, "pagination", 80)
+        _step_done(job, "pagination", 79)
 
-        # ─ Étape 11 : Export DOCX
-        _step_start(job, "export_docx", "Sauvegarde du DOCX corrigé…")
+        _step_start(job, "export_docx", "Sauvegarde DOCX corrige...")
         doc.save(str(output_docx))
         _step_done(job, "export_docx", 88)
 
-        # ─ Étape 12 : Conversion PDF via LibreOffice
-        _step_start(job, "export_pdf", "Conversion PDF via LibreOffice…")
-        await asyncio.to_thread(_convert_to_pdf, output_docx, output_pdf)
+        _step_start(job, "export_pdf", "Conversion PDF + mise a jour TOC...")
+        await asyncio.to_thread(_to_pdf, output_docx, output_pdf)
         _step_done(job, "export_pdf", 100)
 
-        # ─ Finalisation
-        duration = round(time.time() - start_time, 1)
+        duration = round(time.time() - start, 1)
         job.stats = {
             "pagesCount": _count_pages(doc),
-            "headingsDetected": headings_count,
-            "imagesFixed": images_fixed,
+            "headingsDetected": n_heads,
+            "imagesFixed": n_img,
             "fontsHarmonized": 1,
             "durationSeconds": duration,
+            "aiProvider": ai_result.provider.value,
+            "tocInserted": toc_ok,
         }
-        job.status   = "done"
+        job.status = "done"
         job.progress = 100
-        job.current_step = "Traitement terminé"
-        logger.info(f"Job {job_id} terminé en {duration}s")
+        job.current_step = "Traitement termine"
+        logger.info(f"Job {job_id} OK en {duration}s")
 
     except Exception as exc:
         logger.error(f"Erreur job {job_id}: {exc}", exc_info=True)
-        job.status    = "error"
-        job.error     = str(exc)
+        job.status = "error"
+        job.error = str(exc)
         job.current_step = "Erreur de traitement"
-        # Marquer l'étape en cours comme erreur
-        for step in job.steps:
-            if step.status == "running":
-                step.status = "error"
+        for s in job.steps:
+            if s.status == "running":
+                s.status = "error"
     finally:
-        # Supprimer le fichier d'entrée
-        if input_path.exists():
-            input_path.unlink(missing_ok=True)
+        input_path.unlink(missing_ok=True)
 
 
-# ── Helpers de progression ─────────────────────────────────────────────────────
-def _step_start(job, step_id: str, message: str):
-    job.set_step_running(step_id)
-    job.current_step = message
-    logger.info(f"[{job.job_id}] → {message}")
+def _step_start(job, sid, msg):
+    job.set_step_running(sid)
+    job.current_step = msg
+    logger.info(f"[{job.job_id}] {msg}")
 
-
-def _step_done(job, step_id: str, progress: int):
-    job.set_step_done(step_id)
+def _step_done(job, sid, pct):
+    job.set_step_done(sid)
     job.recalculate_progress()
-    if progress > job.progress:
-        job.progress = progress
+    if pct > job.progress:
+        job.progress = pct
 
 
-# ── Étape 3 : Analyse Gemini ───────────────────────────────────────────────────
-async def _analyze_with_gemini(doc: Document) -> dict:
-    """
-    Envoie un extrait du document à Gemini Flash pour identifier :
-    - Les lignes qui semblent être des titres
-    - Le style général du document
-    """
-    if not settings.GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY non configurée — analyse IA ignorée")
-        return {"likely_titles": [], "doc_type": "unknown"}
-
-    # Extraire les 50 premiers paragraphes non vides
-    paragraphs = [
-        {"idx": i, "text": p.text.strip(), "len": len(p.text.strip())}
-        for i, p in enumerate(doc.paragraphs)
-        if p.text.strip()
-    ][:50]
-
-    prompt = f"""Analyse ce document Word et identifie les titres et sous-titres.
-
-Voici les premiers paragraphes (index: texte) :
-{chr(10).join(f"[{p['idx']}] {p['text'][:120]}" for p in paragraphs)}
-
-Réponds UNIQUEMENT en JSON valide avec cette structure :
-{{
-  "doc_type": "rapport|lettre|contrat|article|autre",
-  "likely_titles": [
-    {{"idx": 0, "level": 1, "reason": "court, sans ponctuation finale"}},
-    ...
-  ],
-  "main_font": "nom de police détectée ou null",
-  "language": "fr|en|autre"
-}}
-
-Critères d'un titre : texte court (<80 car), pas de point final, souvent en majuscules ou première lettre maj, logique de section."""
-
-    try:
-        model = genai.GenerativeModel(settings.GEMINI_MODEL)
-        response = await asyncio.to_thread(
-            model.generate_content,
-            prompt,
-            generation_config={"temperature": 0.1, "max_output_tokens": 1024},
-        )
-        import json, re
-        raw = response.text.strip()
-        # Nettoyer les balises markdown éventuelles
-        raw = re.sub(r"```json|```", "", raw).strip()
-        result = json.loads(raw)
-        logger.info(f"Gemini : {len(result.get('likely_titles', []))} titres détectés, type={result.get('doc_type')}")
-        return result
-    except Exception as e:
-        logger.warning(f"Gemini indisponible : {e} — fallback heuristique")
-        return {"likely_titles": [], "doc_type": "unknown"}
-
-
-# ── Étape 4 : Nettoyage des espaces ───────────────────────────────────────────
-def _clean_whitespace(doc: Document):
-    """
-    - Supprime les espaces doubles
-    - Supprime les sauts de ligne multiples consécutifs
-    - Nettoie les espaces en début/fin de paragraphe
-    """
+def _clean_whitespace(doc):
     prev_empty = False
-    paragraphs_to_delete = []
-
-    for i, para in enumerate(doc.paragraphs):
-        # Nettoyer chaque run
+    to_del = []
+    for para in doc.paragraphs:
         for run in para.runs:
-            import re
-            run.text = re.sub(r' {2,}', ' ', run.text)  # espaces doubles
-            run.text = re.sub(r'\t', ' ', run.text)       # tabulations → espace
-
-        # Détecter les lignes vides consécutives
-        text = para.text.strip()
-        if not text:
+            run.text = re.sub(r' {2,}', ' ', run.text)
+            run.text = re.sub(r'\t+', ' ', run.text)
+        if not para.text.strip():
             if prev_empty:
-                paragraphs_to_delete.append(para)
+                to_del.append(para)
             prev_empty = True
         else:
             prev_empty = False
-
-    # Supprimer les paragraphes vides en surplus
-    for para in paragraphs_to_delete:
-        p = para._element
-        p.getparent().remove(p)
+    for p in to_del:
+        p._element.getparent().remove(p._element)
 
 
-# ── Étape 5 : Harmonisation des polices ───────────────────────────────────────
-def _harmonize_fonts(doc: Document):
-    """
-    Unifie la police du corps de texte sur Calibri 11pt.
-    Les titres (Heading) ne sont pas modifiés ici.
-    """
-    TARGET_FONT = "Calibri"
-    TARGET_SIZE = Pt(11)
-
+def _harmonize_fonts(doc):
     for para in doc.paragraphs:
-        style_name = para.style.name if para.style else ""
-        # Ne pas toucher aux styles de titre
-        if style_name.startswith("Heading") or style_name.startswith("Title"):
+        sn = para.style.name if para.style else ""
+        if any(sn.startswith(x) for x in ["Heading", "Title", "TOC"]):
             continue
         for run in para.runs:
             if run.font.size and run.font.size > Pt(14):
-                continue  # probablement un titre inline, ne pas modifier
-            run.font.name = TARGET_FONT
-            if not run.font.size or run.font.size < Pt(8) or run.font.size > Pt(14):
-                run.font.size = TARGET_SIZE
+                continue
+            run.font.name = FONT_BODY
+            if not run.font.size or not (Pt(8) <= run.font.size <= Pt(14)):
+                run.font.size = Pt(11)
+            run.font.color.rgb = COLOR_BODY
 
 
-# ── Étape 6 : Détection des titres ────────────────────────────────────────────
-def _detect_headings(doc: Document, ai_hints: dict) -> int:
-    """
-    Marque les paragraphes comme titres en combinant :
-    1. Les suggestions de Gemini
-    2. Une heuristique locale (taille police, texte court, etc.)
-    """
-    import re
-
-    # Construire un set des index suggérés par Gemini
-    ai_title_map = {}
-    for t in ai_hints.get("likely_titles", []):
-        ai_title_map[t["idx"]] = t.get("level", 1)
-
+def _detect_headings(doc, ai_hints):
+    ai_map = {t["idx"]: t.get("level", 1) for t in ai_hints.get("likely_titles", [])}
     count = 0
     for i, para in enumerate(doc.paragraphs):
         text = para.text.strip()
         if not text or len(text) > 150:
             continue
-
-        # Déjà un style de titre → skip
-        if para.style and para.style.name.startswith("Heading"):
+        sn = para.style.name if para.style else ""
+        if sn.startswith("Heading"):
+            para._heading_level = int(sn[-1]) if sn[-1].isdigit() else 1
             count += 1
             continue
-
         level = None
-
-        # 1. Suggestion IA
-        if i in ai_title_map:
-            level = ai_title_map[i]
-
-        # 2. Heuristique locale
+        if i in ai_map:
+            level = ai_map[i]
         else:
-            is_short = len(text) < 80
-            no_period = not text.endswith(".")
-            has_big_font = any(
-                r.font.size and r.font.size >= Pt(14)
-                for r in para.runs if r.font.size
-            )
-            is_bold_only = all(
-                r.bold for r in para.runs if r.text.strip()
-            ) and para.runs
-            is_all_caps = text == text.upper() and len(text) > 3
-            is_numbered = bool(re.match(r"^\d+[\.\)]\s+\w", text))
-            roman_num   = bool(re.match(r"^[IVX]+[\.\)]\s+\w", text))
-
-            if has_big_font and is_short and no_period:
-                level = 1
-            elif is_bold_only and is_short and no_period:
-                level = 2
-            elif (is_numbered or roman_num) and is_short:
-                level = 2
-            elif is_all_caps and is_short and no_period:
-                level = 1
-
+            short   = len(text) < 80
+            no_dot  = not text.endswith(".")
+            big_f   = any(r.font.size and r.font.size >= Pt(14) for r in para.runs if r.font.size)
+            bold    = bool(para.runs) and all(r.bold for r in para.runs if r.text.strip())
+            caps    = text == text.upper() and len(text) > 3
+            num     = bool(re.match(r"^\d+[\.\)]\s+\w", text))
+            roman   = bool(re.match(r"^[IVX]+[\.\)]\s+\w", text))
+            if big_f and short and no_dot:   level = 1
+            elif bold and short and no_dot:  level = 2
+            elif (num or roman) and short:   level = 2
+            elif caps and short and no_dot:  level = 1
         if level:
-            para._heading_level = level  # on stocke pour l'étape suivante
+            para._heading_level = level
             count += 1
-
-    logger.info(f"Titres détectés : {count}")
     return count
 
 
-# ── Étape 7 : Application des styles Heading ──────────────────────────────────
-def _apply_styles(doc: Document):
-    """
-    Applique les styles Heading 1/2/3 aux paragraphes marqués.
-    Personnalise les styles si besoin.
-    """
-    for para in doc.paragraphs:
-        level = getattr(para, "_heading_level", None)
-        if level:
-            style_name = f"Heading {min(level, 3)}"
+def _setup_styles(doc):
+    """Configure les styles Heading 1/2/3 du document."""
+    cfgs = {
+        "Heading 1": dict(size=Pt(20), color=COLOR_H1, bold=True, italic=False,
+                          caps=True,  align=WD_ALIGN_PARAGRAPH.LEFT,
+                          before=Pt(24), after=Pt(8)),
+        "Heading 2": dict(size=Pt(15), color=COLOR_H2, bold=True, italic=False,
+                          caps=False, align=WD_ALIGN_PARAGRAPH.LEFT,
+                          before=Pt(18), after=Pt(6)),
+        "Heading 3": dict(size=Pt(12), color=COLOR_H3, bold=True, italic=True,
+                          caps=False, align=WD_ALIGN_PARAGRAPH.LEFT,
+                          before=Pt(12), after=Pt(4)),
+    }
+    for name, c in cfgs.items():
+        try:
             try:
-                para.style = doc.styles[style_name]
+                st = doc.styles[name]
             except KeyError:
-                logger.warning(f"Style '{style_name}' absent — ignoré")
+                st = doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+            st.font.name = FONT_HEAD
+            st.font.size = c["size"]
+            st.font.color.rgb = c["color"]
+            st.font.bold = c["bold"]
+            st.font.italic = c["italic"]
+            if c["caps"]:
+                st.font.all_caps = True
+            pf = st.paragraph_format
+            pf.alignment = c["align"]
+            pf.space_before = c["before"]
+            pf.space_after  = c["after"]
+            pf.keep_with_next = True
+            pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+        except Exception as e:
+            logger.warning(f"Style {name}: {e}")
+
+    try:
+        n = doc.styles["Normal"]
+        n.font.name = FONT_BODY
+        n.font.size = Pt(11)
+        n.font.color.rgb = COLOR_BODY
+        n.paragraph_format.space_after = Pt(6)
+        n.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    except Exception:
+        pass
 
 
-# ── Étape 8 : Table des matières ──────────────────────────────────────────────
-def _add_table_of_contents(doc: Document):
-    """
-    Insère un champ TOC Word au début du document.
-    La table se génère lors de l'ouverture dans Word / LibreOffice.
-    """
-    # Vérifier s'il y a des titres
-    has_headings = any(
-        p.style and p.style.name.startswith("Heading")
-        for p in doc.paragraphs
-    )
-    if not has_headings:
-        logger.info("Aucun titre trouvé — table des matières ignorée")
-        return
-
-    # Trouver la position d'insertion (après le premier paragraphe non vide)
-    insert_before = None
-    for para in doc.paragraphs:
-        if para.text.strip():
-            insert_before = para
-            break
-
-    # Créer le paragraphe titre "Table des matières"
-    toc_title_para = OxmlElement("w:p")
-    toc_title_run  = OxmlElement("w:r")
-    toc_title_text = OxmlElement("w:t")
-    toc_title_text.text = "Table des matières"
-    toc_title_rpr = OxmlElement("w:rPr")
-    bold_elem = OxmlElement("w:b")
-    toc_title_rpr.append(bold_elem)
-    toc_title_run.append(toc_title_rpr)
-    toc_title_run.append(toc_title_text)
-    toc_title_para.append(toc_title_run)
-
-    # Créer le champ TOC
-    toc_para = OxmlElement("w:p")
-    toc_run  = OxmlElement("w:r")
-    fld_char_begin = OxmlElement("w:fldChar")
-    fld_char_begin.set(qn("w:fldCharType"), "begin")
-    instr_text = OxmlElement("w:instrText")
-    instr_text.set(qn("xml:space"), "preserve")
-    instr_text.text = ' TOC \\o "1-3" \\h \\z \\u '
-    fld_char_sep = OxmlElement("w:fldChar")
-    fld_char_sep.set(qn("w:fldCharType"), "separate")
-    fld_char_end = OxmlElement("w:fldChar")
-    fld_char_end.set(qn("w:fldCharType"), "end")
-
-    toc_run.append(fld_char_begin)
-    toc_run.append(instr_text)
-    toc_run.append(fld_char_sep)
-    toc_run.append(fld_char_end)
-    toc_para.append(toc_run)
-
-    # Paragraphe de séparation
-    sep_para = OxmlElement("w:p")
-
-    # Insérer avant le premier paragraphe
-    if insert_before is not None:
-        ref = insert_before._element
-        parent = ref.getparent()
-        idx = list(parent).index(ref)
-        parent.insert(idx, sep_para)
-        parent.insert(idx, toc_para)
-        parent.insert(idx, toc_title_para)
-    else:
-        doc.element.body.append(toc_title_para)
-        doc.element.body.append(toc_para)
-        doc.element.body.append(sep_para)
-
-    logger.info("Table des matières insérée")
-
-
-# ── Étape 9 : Images ──────────────────────────────────────────────────────────
-def _fix_images(doc: Document) -> int:
-    """
-    Pour chaque image :
-    - Centre le paragraphe contenant l'image
-    - Redimensionne si trop large (max 14cm de large)
-    """
-    MAX_WIDTH = Cm(14)
-    count = 0
+def _apply_heading_styles(doc):
+    """Applique les styles + couleurs inline + filets sur les titres."""
+    color_map = {1: COLOR_H1, 2: COLOR_H2, 3: COLOR_H3}
+    size_map  = {1: Pt(20),   2: Pt(15),   3: Pt(12)}
 
     for para in doc.paragraphs:
-        has_image = False
+        lvl = getattr(para, "_heading_level", None)
+        if not lvl:
+            continue
+        lvl = min(lvl, 3)
+        try:
+            para.style = doc.styles[f"Heading {lvl}"]
+        except KeyError:
+            pass
         for run in para.runs:
-            # Détecter les images inline
-            for drawing in run._element.findall(
-                ".//{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}inline"
-            ) + run._element.findall(
-                ".//{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}anchor"
-            ):
-                has_image = True
-                # Chercher l'extent (dimensions)
-                extent = drawing.find(
-                    "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}extent"
-                )
-                if extent is not None:
-                    cx = int(extent.get("cx", 0))
-                    # 914400 EMUs = 1 pouce = 2.54 cm
-                    max_cx = int(MAX_WIDTH.emu)
-                    if cx > max_cx:
-                        cy = int(extent.get("cy", 0))
-                        ratio = max_cx / cx
-                        extent.set("cx", str(max_cx))
-                        extent.set("cy", str(int(cy * ratio)))
-                        count += 1
+            run.font.name      = FONT_HEAD
+            run.font.size      = size_map[lvl]
+            run.font.color.rgb = color_map[lvl]
+            run.font.bold      = True
+            run.font.italic    = (lvl == 3)
+            if lvl == 1:
+                run.font.all_caps = True
+        if lvl == 1:
+            _add_border(para, "bottom", "1F3564", sz="8")
 
-        if has_image:
+
+def _add_border(para, side, color_hex, sz="6"):
+    pPr  = para._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    el   = OxmlElement(f"w:{side}")
+    el.set(qn("w:val"),   "single")
+    el.set(qn("w:sz"),    sz)
+    el.set(qn("w:space"), "4")
+    el.set(qn("w:color"), color_hex)
+    pBdr.append(el)
+    old = pPr.find(qn("w:pBdr"))
+    if old is not None:
+        pPr.remove(old)
+    pPr.append(pBdr)
+
+
+def _add_toc(doc) -> bool:
+    """Insère la TOC avec champ dirty=true pour forcer la mise à jour par LibreOffice."""
+    has_h = any(p.style and p.style.name.startswith("Heading") for p in doc.paragraphs)
+    if not has_h:
+        return False
+
+    first = next((p for p in doc.paragraphs if p.text.strip()), None)
+
+    # Titre centré "TABLE DES MATIÈRES"
+    title_p = OxmlElement("w:p")
+    title_ppr = OxmlElement("w:pPr")
+    jc = OxmlElement("w:jc"); jc.set(qn("w:val"), "center")
+    sp = OxmlElement("w:spacing")
+    sp.set(qn("w:before"), "480"); sp.set(qn("w:after"), "240")
+    title_ppr.append(jc); title_ppr.append(sp)
+    title_p.append(title_ppr)
+    title_r   = OxmlElement("w:r")
+    title_rpr = OxmlElement("w:rPr")
+    for tag, val in [("w:b", None), ("w:caps", None),
+                     ("w:sz", "28"), ("w:color", "1F3564")]:
+        el = OxmlElement(tag)
+        if val: el.set(qn("w:val"), val)
+        title_rpr.append(el)
+    title_r.append(title_rpr)
+    title_t = OxmlElement("w:t"); title_t.text = "Table des matières"
+    title_r.append(title_t); title_p.append(title_r)
+
+    # Champ TOC avec dirty=true (LibreOffice le met à jour à la conversion)
+    fld_p  = OxmlElement("w:p")
+    r1 = OxmlElement("w:r")
+    fc1 = OxmlElement("w:fldChar")
+    fc1.set(qn("w:fldCharType"), "begin")
+    fc1.set(qn("w:dirty"), "true")   # ← CLEF : force la mise à jour
+    r1.append(fc1); fld_p.append(r1)
+
+    r2 = OxmlElement("w:r")
+    it = OxmlElement("w:instrText")
+    it.set(qn("xml:space"), "preserve")
+    it.text = ' TOC \\o "1-3" \\h \\z \\u '
+    r2.append(it); fld_p.append(r2)
+
+    r3 = OxmlElement("w:r")
+    fc3 = OxmlElement("w:fldChar"); fc3.set(qn("w:fldCharType"), "separate")
+    r3.append(fc3); fld_p.append(r3)
+
+    r4 = OxmlElement("w:r")
+    ph = OxmlElement("w:t")
+    ph.text = "Table des matieres en cours de generation..."
+    r4.append(ph); fld_p.append(r4)
+
+    r5 = OxmlElement("w:r")
+    fc5 = OxmlElement("w:fldChar"); fc5.set(qn("w:fldCharType"), "end")
+    r5.append(fc5); fld_p.append(r5)
+
+    # Saut de page
+    pb_p  = OxmlElement("w:p")
+    pb_r  = OxmlElement("w:r")
+    pb_el = OxmlElement("w:br"); pb_el.set(qn("w:type"), "page")
+    pb_r.append(pb_el); pb_p.append(pb_r)
+
+    elems = [title_p, fld_p, pb_p]
+    if first is not None:
+        ref = first._element
+        par = ref.getparent()
+        idx = list(par).index(ref)
+        for el in reversed(elems):
+            par.insert(idx, el)
+    else:
+        for el in elems:
+            doc.element.body.append(el)
+
+    logger.info("TOC inseree (dirty=true)")
+    return True
+
+
+def _fix_images(doc) -> int:
+    MAX = Cm(14)
+    NS  = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+    n   = 0
+    for para in doc.paragraphs:
+        has_img = False
+        for run in para.runs:
+            for tag in [f"{{{NS}}}inline", f"{{{NS}}}anchor"]:
+                for d in run._element.findall(f".//{tag}"):
+                    has_img = True
+                    ext = d.find(f"{{{NS}}}extent")
+                    if ext is not None:
+                        cx = int(ext.get("cx", 0))
+                        mx = int(MAX.emu)
+                        if cx > mx:
+                            cy = int(ext.get("cy", 0))
+                            ext.set("cx", str(mx))
+                            ext.set("cy", str(int(cy * mx / cx)))
+                            n += 1
+        if has_img:
             para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    logger.info(f"Images traitées : {count} redimensionnées")
-    return count
+    return n
 
 
-# ── Étape 10 : Pagination et pied de page ────────────────────────────────────
-def _add_pagination(doc: Document):
-    """
-    Ajoute un pied de page avec :
-    - Nom du document (centré)
-    - Numéro de page (droite)
-    """
-    from docx.oxml.ns import nsmap
-
-    # S'assurer qu'il y a une section
+def _add_pagination(doc):
     if not doc.sections:
         return
+    for sec in doc.sections:
+        sec.top_margin    = Cm(2.5)
+        sec.bottom_margin = Cm(2.5)
+        sec.left_margin   = Cm(2.5)
+        sec.right_margin  = Cm(2.5)
 
-    section = doc.sections[-1]
-    footer = section.footer
+    footer = doc.sections[-1].footer
+    fp = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+    fp.clear()
+    fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _add_border(fp, "top", "CCCCCC", sz="4")
 
-    # Vider le footer existant
-    for para in footer.paragraphs:
-        for run in para.runs:
-            run.text = ""
-
-    # Créer le paragraphe du pied de page
-    if footer.paragraphs:
-        footer_para = footer.paragraphs[0]
-    else:
-        footer_para = footer.add_paragraph()
-
-    footer_para.clear()
-    footer_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-
-    # Ajouter "Impulse AI | DocFix  —  Page X / Y"
-    run1 = footer_para.add_run("Impulse AI | DocFix  —  Page ")
-    run1.font.size = Pt(8)
-    run1.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
-
-    # Champ PAGE
-    _add_field(footer_para, "PAGE")
-
-    run2 = footer_para.add_run(" / ")
-    run2.font.size = Pt(8)
-    run2.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
-
-    # Champ NUMPAGES
-    _add_field(footer_para, "NUMPAGES")
-
-    # Activer le pied de page
-    sectPr = section._sectPr
-    pg_sz = sectPr.find(qn("w:pgSz"))
-    footer_ref = OxmlElement("w:footerReference")
-    footer_ref.set(qn("w:type"), "default")
+    r1 = fp.add_run("Impulse AI  |  DocFix          Page ")
+    r1.font.name = FONT_BODY; r1.font.size = Pt(8); r1.font.color.rgb = COLOR_FOOTER
+    _add_field(fp, "PAGE")
+    r2 = fp.add_run(" / ")
+    r2.font.name = FONT_BODY; r2.font.size = Pt(8); r2.font.color.rgb = COLOR_FOOTER
+    _add_field(fp, "NUMPAGES")
 
 
-def _add_field(para, field_name: str):
-    """Insère un champ Word (PAGE, NUMPAGES…) dans un paragraphe."""
-    run = OxmlElement("w:r")
-    rpr = OxmlElement("w:rPr")
-    sz = OxmlElement("w:sz")
-    sz.set(qn("w:val"), "16")  # 8pt = 16 half-points
-    rpr.append(sz)
-    run.append(rpr)
-
-    fld_begin = OxmlElement("w:fldChar")
-    fld_begin.set(qn("w:fldCharType"), "begin")
-    run.append(fld_begin)
-    para._p.append(run)
-
-    run2 = OxmlElement("w:r")
-    instr = OxmlElement("w:instrText")
-    instr.set(qn("xml:space"), "preserve")
-    instr.text = f" {field_name} "
-    run2.append(instr)
-    para._p.append(run2)
-
-    run3 = OxmlElement("w:r")
-    fld_end = OxmlElement("w:fldChar")
-    fld_end.set(qn("w:fldCharType"), "end")
-    run3.append(fld_end)
-    para._p.append(run3)
+def _add_field(para, name):
+    for ftype, content in [("begin", None), (None, name), ("end", None)]:
+        r = OxmlElement("w:r")
+        rpr = OxmlElement("w:rPr")
+        sz = OxmlElement("w:sz"); sz.set(qn("w:val"), "16")
+        col = OxmlElement("w:color"); col.set(qn("w:val"), "808080")
+        rpr.append(sz); rpr.append(col); r.append(rpr)
+        if ftype:
+            fc = OxmlElement("w:fldChar"); fc.set(qn("w:fldCharType"), ftype); r.append(fc)
+        else:
+            it = OxmlElement("w:instrText")
+            it.set(qn("xml:space"), "preserve"); it.text = f" {content} "; r.append(it)
+        para._p.append(r)
 
 
-# ── Étape 12 : Conversion PDF via LibreOffice ─────────────────────────────────
-def _convert_to_pdf(docx_path: Path, pdf_path: Path):
+def _to_pdf(docx_path: Path, pdf_path: Path):
     """
-    Convertit le DOCX en PDF via LibreOffice headless.
-    Requis sur Render : LibreOffice installé via apt.
+    Conversion PDF via LibreOffice.
+    Le flag --infilter + dirty=true sur le champ TOC force la mise à jour.
     """
+    env = {**os.environ, "HOME": "/tmp", "DISPLAY": ""}
     cmd = [
         settings.LIBREOFFICE_PATH,
-        "--headless",
+        "--headless", "--norestore", "--nofirststartwizard",
         "--convert-to", "pdf",
         "--outdir", str(pdf_path.parent),
         str(docx_path),
     ]
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"LibreOffice error: {result.stderr}")
-
-        # LibreOffice nomme le fichier en fonction du docx
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env)
         generated = pdf_path.parent / (docx_path.stem + ".pdf")
         if generated.exists() and generated != pdf_path:
             generated.rename(pdf_path)
-
         if not pdf_path.exists():
-            raise FileNotFoundError("Le fichier PDF n'a pas été généré")
-
-        logger.info(f"PDF généré : {pdf_path} ({pdf_path.stat().st_size // 1024} Ko)")
-
+            raise FileNotFoundError("PDF non genere")
+        logger.info(f"PDF OK : {pdf_path.stat().st_size // 1024} Ko")
     except subprocess.TimeoutExpired:
-        raise RuntimeError("LibreOffice : timeout dépassé (120s)")
+        raise RuntimeError("LibreOffice timeout 180s")
     except FileNotFoundError:
-        raise RuntimeError(
-            f"LibreOffice introuvable à '{settings.LIBREOFFICE_PATH}'. "
-            "Vérifier l'installation sur Render."
-        )
+        raise RuntimeError(f"LibreOffice introuvable : {settings.LIBREOFFICE_PATH}")
 
 
-# ── Utilitaires ───────────────────────────────────────────────────────────────
-def _count_pages(doc: Document) -> int:
-    """Estimation du nombre de pages (approximatif sans rendu)."""
-    total_lines = sum(
-        max(1, len(p.text) // 80)
-        for p in doc.paragraphs
-        if p.text.strip()
-    )
-    return max(1, total_lines // 40)
+def _count_pages(doc) -> int:
+    total = sum(max(1, len(p.text) // 80) for p in doc.paragraphs if p.text.strip())
+    return max(1, total // 40)
