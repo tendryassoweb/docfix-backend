@@ -1,10 +1,16 @@
 """
-processor.py v1.3 — Fix TOC + couleurs + centrage
+processor.py v1.4 — Fix TOC + couleurs forcées
 Impulse AI — DocFix
+
+Fixes:
+- TOC insérée AVANT la vérification des styles (was checking before applying)
+- Couleurs forcées via XML direct (bypass complet des styles Word)
+- Styles appliqués MÊME si l'IA utilise l'heuristique
 """
 
-import asyncio, logging, subprocess, time, re, os, tempfile
+import asyncio, logging, subprocess, time, re, os
 from pathlib import Path
+from lxml import etree
 
 from docx import Document
 from docx.shared import Pt, Cm, RGBColor
@@ -56,15 +62,18 @@ async def process_document(job_id: str, input_path: Path):
         await asyncio.to_thread(_harmonize_fonts, doc)
         _step_done(job, "fonts", 34)
 
+        # ── ÉTAPE CLÉ : détecter ET marquer les titres ──────────────
         _step_start(job, "headings", "Detection des titres...")
         n_heads = await asyncio.to_thread(_detect_headings, doc, ai_result.data)
         _step_done(job, "headings", 44)
 
+        # ── Appliquer les styles Heading sur les paragraphes marqués ─
         _step_start(job, "styles", "Application styles et couleurs...")
         await asyncio.to_thread(_setup_styles, doc)
         await asyncio.to_thread(_apply_heading_styles, doc)
         _step_done(job, "styles", 54)
 
+        # ── TOC APRÈS les styles (les Heading existent maintenant) ───
         _step_start(job, "toc", "Generation table des matieres...")
         toc_ok = await asyncio.to_thread(_add_toc, doc)
         _step_done(job, "toc", 63)
@@ -81,29 +90,29 @@ async def process_document(job_id: str, input_path: Path):
         doc.save(str(output_docx))
         _step_done(job, "export_docx", 88)
 
-        _step_start(job, "export_pdf", "Conversion PDF avec TOC...")
+        _step_start(job, "export_pdf", "Conversion PDF...")
         await asyncio.to_thread(_to_pdf, output_docx, output_pdf)
         _step_done(job, "export_pdf", 100)
 
         duration = round(time.time() - start, 1)
         job.stats = {
-            "pagesCount": _count_pages(doc),
+            "pagesCount":       _count_pages(doc),
             "headingsDetected": n_heads,
-            "imagesFixed": n_img,
-            "fontsHarmonized": 1,
-            "durationSeconds": duration,
-            "aiProvider": ai_result.provider.value,
-            "tocInserted": toc_ok,
+            "imagesFixed":      n_img,
+            "fontsHarmonized":  1,
+            "durationSeconds":  duration,
+            "aiProvider":       ai_result.provider.value,
+            "tocInserted":      toc_ok,
         }
-        job.status = "done"
-        job.progress = 100
+        job.status       = "done"
+        job.progress     = 100
         job.current_step = "Traitement termine"
-        logger.info(f"Job {job_id} OK en {duration}s")
+        logger.info(f"Job {job_id} OK en {duration}s — heads={n_heads} toc={toc_ok}")
 
     except Exception as exc:
         logger.error(f"Erreur job {job_id}: {exc}", exc_info=True)
-        job.status = "error"
-        job.error = str(exc)
+        job.status       = "error"
+        job.error        = str(exc)
         job.current_step = "Erreur de traitement"
         for s in job.steps:
             if s.status == "running":
@@ -149,22 +158,29 @@ def _harmonize_fonts(doc):
         for run in para.runs:
             if run.font.size and run.font.size > Pt(14):
                 continue
-            run.font.name = FONT_BODY
+            run.font.name      = FONT_BODY
+            run.font.color.rgb = COLOR_BODY
             if not run.font.size or not (Pt(8) <= run.font.size <= Pt(14)):
                 run.font.size = Pt(11)
-            run.font.color.rgb = COLOR_BODY
 
 
-def _detect_headings(doc, ai_hints):
+def _detect_headings(doc, ai_hints) -> int:
+    """
+    Détecte les titres et stocke _heading_level sur chaque paragraphe.
+    Fonctionne que l'IA soit Gemini ou heuristique.
+    """
     ai_map = {t["idx"]: t.get("level", 1) for t in ai_hints.get("likely_titles", [])}
-    count = 0
+    count  = 0
+
     for i, para in enumerate(doc.paragraphs):
         text = para.text.strip()
         if not text or len(text) > 150:
             continue
+
         sn = para.style.name if para.style else ""
+
+        # Déjà Heading dans le doc original → garder le niveau
         if sn.startswith("Heading"):
-            # Déjà un titre — récupérer le niveau et FORCER la réécriture des styles
             try:
                 lvl = int(sn.split()[-1])
             except (ValueError, IndexError):
@@ -172,10 +188,12 @@ def _detect_headings(doc, ai_hints):
             para._heading_level = lvl
             count += 1
             continue
-        level = None
-        if i in ai_map:
-            level = ai_map[i]
-        else:
+
+        # Suggestion IA
+        level = ai_map.get(i)
+
+        # Heuristique locale si pas de suggestion IA
+        if level is None:
             short  = len(text) < 80
             no_dot = not text.endswith(".")
             big_f  = any(r.font.size and r.font.size >= Pt(14) for r in para.runs if r.font.size)
@@ -183,18 +201,22 @@ def _detect_headings(doc, ai_hints):
             caps   = text == text.upper() and len(text) > 3
             num    = bool(re.match(r"^\d+[\.\)]\s+\w", text))
             roman  = bool(re.match(r"^[IVX]+[\.\)]\s+\w", text))
-            if big_f and short and no_dot:  level = 1
-            elif bold and short and no_dot: level = 2
-            elif (num or roman) and short:  level = 2
-            elif caps and short and no_dot: level = 1
+
+            if   big_f and short and no_dot:  level = 1
+            elif bold  and short and no_dot:  level = 2
+            elif (num or roman) and short:    level = 2
+            elif caps  and short and no_dot:  level = 1
+
         if level:
             para._heading_level = level
             count += 1
+
+    logger.info(f"Titres detectes : {count} (IA: {len(ai_map)})")
     return count
 
 
 def _setup_styles(doc):
-    """Redéfinit les styles Heading dans le document."""
+    """Redéfinit les styles Heading 1/2/3 au niveau du document."""
     cfgs = {
         "Heading 1": dict(size=Pt(18), color=COLOR_H1, bold=True,  italic=False,
                           caps=True,  before=Pt(24), after=Pt(8)),
@@ -224,13 +246,14 @@ def _setup_styles(doc):
             pf.alignment         = WD_ALIGN_PARAGRAPH.LEFT
         except Exception as e:
             logger.warning(f"Style {name}: {e}")
+
     try:
         n = doc.styles["Normal"]
         n.font.name      = FONT_BODY
         n.font.size      = Pt(11)
         n.font.color.rgb = COLOR_BODY
-        n.paragraph_format.space_after  = Pt(6)
-        n.paragraph_format.alignment    = WD_ALIGN_PARAGRAPH.JUSTIFY
+        n.paragraph_format.space_after       = Pt(6)
+        n.paragraph_format.alignment         = WD_ALIGN_PARAGRAPH.JUSTIFY
         n.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
     except Exception:
         pass
@@ -238,11 +261,11 @@ def _setup_styles(doc):
 
 def _apply_heading_styles(doc):
     """
-    FIX PRINCIPAL : applique les couleurs/tailles DIRECTEMENT sur les runs.
-    Cela écrase les styles inline existants dans le DOCX original.
+    Applique les styles visuels sur tous les titres détectés.
+    Utilise _force_run_color() pour bypasser les styles inline Word.
     """
-    color_map = {1: COLOR_H1, 2: COLOR_H2, 3: COLOR_H3}
-    size_map  = {1: Pt(18),   2: Pt(14),   3: Pt(12)}
+    color_map = {1: COLOR_H1,  2: COLOR_H2,  3: COLOR_H3}
+    size_map  = {1: Pt(18),    2: Pt(14),    3: Pt(12)}
 
     for para in doc.paragraphs:
         lvl = getattr(para, "_heading_level", None)
@@ -250,50 +273,113 @@ def _apply_heading_styles(doc):
             continue
         lvl = min(lvl, 3)
 
-        # 1. Appliquer le style paragraphe
+        # 1. Style paragraphe
         try:
             para.style = doc.styles[f"Heading {lvl}"]
         except KeyError:
             pass
 
-        # 2. FORCER sur chaque run (écrase le formatage inline original)
+        # 2. Forcer couleur + taille sur chaque run via XML direct
         for run in para.runs:
-            run.font.name      = FONT_HEAD
-            run.font.size      = size_map[lvl]
-            run.font.color.rgb = color_map[lvl]
-            run.font.bold      = True
-            run.font.italic    = (lvl == 3)
-            if lvl == 1:
-                run.font.all_caps = True
-            # Supprimer la couleur thème (qui peut écraser la couleur RGB)
-            _remove_theme_color(run)
+            _force_run_formatting(
+                run,
+                color=color_map[lvl],
+                size=size_map[lvl],
+                bold=True,
+                italic=(lvl == 3),
+                all_caps=(lvl == 1),
+            )
 
-        # 3. Filet sous H1
-        if lvl == 1:
-            _set_border(para, "bottom", "1F3564", "8")
-
-        # 4. Espacement paragraphe
+        # 3. Espacement paragraphe direct
         pf = para.paragraph_format
-        pf.space_before = {1: Pt(24), 2: Pt(16), 3: Pt(12)}[lvl]
-        pf.space_after  = {1: Pt(8),  2: Pt(6),  3: Pt(4)}[lvl]
+        pf.space_before   = {1: Pt(24), 2: Pt(16), 3: Pt(12)}[lvl]
+        pf.space_after    = {1: Pt(8),  2: Pt(6),  3: Pt(4)}[lvl]
         pf.keep_with_next = True
 
+        # 4. Filet décoratif sous H1
+        if lvl == 1:
+            _set_para_border(para, "bottom", "1F3564", "8")
 
-def _remove_theme_color(run):
+
+def _force_run_formatting(run, color: RGBColor, size: Pt,
+                           bold=True, italic=False, all_caps=False):
     """
-    Supprime la couleur de thème Word (w:themeColor) sur un run.
-    Sans ça, la couleur thème écrase notre couleur RGB dans certains DOCX.
+    Force le formatage directement dans le XML du run.
+    Supprime TOUTES les couleurs thème Word qui écrasent notre couleur.
+    C'est la méthode la plus fiable pour bypasser les styles inline.
     """
     rpr = run._r.get_or_add_rPr()
+
+    # ── Police ──────────────────────────────────────────────────
+    # rFonts
+    rFonts = rpr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rpr.insert(0, rFonts)
+    rFonts.set(qn("w:ascii"),    FONT_HEAD)
+    rFonts.set(qn("w:hAnsi"),    FONT_HEAD)
+    rFonts.set(qn("w:cs"),       FONT_HEAD)
+
+    # ── Taille ──────────────────────────────────────────────────
+    half_pts = str(int(size.pt * 2))
+    for tag in ["w:sz", "w:szCs"]:
+        el = rpr.find(qn(tag))
+        if el is None:
+            el = OxmlElement(tag)
+            rpr.append(el)
+        el.set(qn("w:val"), half_pts)
+
+    # ── Gras ────────────────────────────────────────────────────
+    b = rpr.find(qn("w:b"))
+    if bold:
+        if b is None:
+            b = OxmlElement("w:b")
+            rpr.append(b)
+    else:
+        if b is not None:
+            rpr.remove(b)
+
+    # ── Italique ────────────────────────────────────────────────
+    i_el = rpr.find(qn("w:i"))
+    if italic:
+        if i_el is None:
+            i_el = OxmlElement("w:i")
+            rpr.append(i_el)
+    else:
+        if i_el is not None:
+            rpr.remove(i_el)
+
+    # ── Majuscules ──────────────────────────────────────────────
+    caps_el = rpr.find(qn("w:caps"))
+    if all_caps:
+        if caps_el is None:
+            caps_el = OxmlElement("w:caps")
+            rpr.append(caps_el)
+    else:
+        if caps_el is not None:
+            rpr.remove(caps_el)
+
+    # ── Couleur — SUPPRIME themeColor et force RGB ───────────────
     color_el = rpr.find(qn("w:color"))
-    if color_el is not None:
-        # Supprimer l'attribut themeColor s'il existe
-        for attr in [qn("w:themeColor"), qn("w:themeTint"), qn("w:themeShade")]:
-            if color_el.get(attr):
-                del color_el.attrib[attr]
+    if color_el is None:
+        color_el = OxmlElement("w:color")
+        rpr.append(color_el)
+
+    hex_color = f"{color.red:02X}{color.green:02X}{color.blue:02X}"
+    color_el.set(qn("w:val"), hex_color)
+
+    # Supprimer toutes les références de thème couleur
+    for attr in [qn("w:themeColor"), qn("w:themeTint"), qn("w:themeShade")]:
+        if attr in color_el.attrib:
+            del color_el.attrib[attr]
+
+    # ── Supprimer highlight éventuel ────────────────────────────
+    hl = rpr.find(qn("w:highlight"))
+    if hl is not None:
+        rpr.remove(hl)
 
 
-def _set_border(para, side, color_hex, sz="6"):
+def _set_para_border(para, side, color_hex, sz="6"):
     pPr  = para._p.get_or_add_pPr()
     pBdr = OxmlElement("w:pBdr")
     el   = OxmlElement(f"w:{side}")
@@ -310,11 +396,19 @@ def _set_border(para, side, color_hex, sz="6"):
 
 def _add_toc(doc) -> bool:
     """
-    Insère la TOC. Le PDF sera généré avec un script LibreOffice Basic
-    qui force la mise à jour des champs avant export.
+    Insère la TOC APRÈS que les styles Heading ont été appliqués.
+    Vérifie la présence de _heading_level plutôt que du style (plus fiable).
     """
-    has_h = any(p.style and p.style.name.startswith("Heading") for p in doc.paragraphs)
+    # Vérifier via _heading_level (posé dans _detect_headings)
+    has_h = any(getattr(p, "_heading_level", None) for p in doc.paragraphs)
     if not has_h:
+        # Fallback : vérifier les styles
+        has_h = any(
+            p.style and p.style.name.startswith("Heading")
+            for p in doc.paragraphs
+        )
+    if not has_h:
+        logger.warning("Aucun titre détecté — TOC ignorée")
         return False
 
     first = next((p for p in doc.paragraphs if p.text.strip()), None)
@@ -359,14 +453,14 @@ def _add_toc(doc) -> bool:
 
     r4 = OxmlElement("w:r")
     ph = OxmlElement("w:t")
-    ph.text = "[ Mise a jour automatique en cours... ]"
+    ph.text = "[ Table des matieres - mise a jour automatique ]"
     r4.append(ph); fld_p.append(r4)
 
     r5 = OxmlElement("w:r")
     fc5 = OxmlElement("w:fldChar"); fc5.set(qn("w:fldCharType"), "end")
     r5.append(fc5); fld_p.append(r5)
 
-    # Saut de page
+    # Saut de page après TOC
     pb_p = OxmlElement("w:p")
     pb_r = OxmlElement("w:r")
     pb_e = OxmlElement("w:br"); pb_e.set(qn("w:type"), "page")
@@ -383,7 +477,7 @@ def _add_toc(doc) -> bool:
         for el in elems:
             doc.element.body.append(el)
 
-    logger.info("TOC inseree (dirty=true)")
+    logger.info(f"TOC inseree — {sum(1 for p in doc.paragraphs if getattr(p,'_heading_level',None))} titres")
     return True
 
 
@@ -423,7 +517,7 @@ def _add_pagination(doc):
     fp = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
     fp.clear()
     fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    _set_border(fp, "top", "CCCCCC", "4")
+    _set_para_border(fp, "top", "CCCCCC", "4")
     r1 = fp.add_run("Impulse AI  |  DocFix          Page ")
     r1.font.name = FONT_BODY; r1.font.size = Pt(8); r1.font.color.rgb = COLOR_FOOTER
     _add_field(fp, "PAGE")
@@ -449,73 +543,34 @@ def _add_field(para, name):
 
 def _to_pdf(docx_path: Path, pdf_path: Path):
     """
-    Conversion PDF via un script LibreOffice Basic.
-    Le script ouvre le document, met à jour TOUS les champs (dont la TOC),
-    puis exporte en PDF. C'est la seule méthode fiable pour avoir la TOC dans le PDF.
+    Conversion PDF via LibreOffice headless.
+    LibreOffice met à jour les champs dirty automatiquement.
     """
-    # Script Basic qui met à jour les champs ET exporte en PDF
-    macro_script = f"""
-import uno
-from com.sun.star.beans import PropertyValue
-
-def convert():
-    ctx  = uno.getComponentContext()
-    smgr = ctx.ServiceManager
-    desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
-
-    url = "file://{docx_path}"
-    doc = desktop.loadComponentFromURL(url, "_blank", 0, [])
-
-    # Mettre à jour tous les champs (TOC, PAGE, NUMPAGES...)
-    doc.getTextFields().refresh()
-    doc.refresh()
-
-    # Mettre à jour les index (table des matières)
-    indexes = doc.getDocumentIndexes()
-    for i in range(indexes.Count):
-        indexes.getByIndex(i).update()
-
-    # Export PDF
-    out_url = "file://{pdf_path}"
-    pdf_filter = PropertyValue()
-    pdf_filter.Name  = "FilterName"
-    pdf_filter.Value = "writer_pdf_Export"
-    doc.storeToURL(out_url, [pdf_filter])
-    doc.close(True)
-"""
-
-    # Écrire le script dans un fichier temp
-    script_path = settings.TEMP_DIR / f"{docx_path.stem}_macro.py"
-    script_path.write_text(macro_script, encoding="utf-8")
-
     env = {**os.environ, "HOME": "/tmp", "DISPLAY": ""}
-
+    cmd = [
+        settings.LIBREOFFICE_PATH,
+        "--headless", "--norestore", "--nofirststartwizard",
+        "--convert-to", "pdf",
+        "--outdir", str(pdf_path.parent),
+        str(docx_path),
+    ]
     try:
-        # Méthode 1 : LibreOffice avec script Python UNO
-        cmd = [
-            settings.LIBREOFFICE_PATH,
-            "--headless", "--norestore", "--nofirststartwizard",
-            "--convert-to", "pdf",
-            "--outdir", str(pdf_path.parent),
-            str(docx_path),
-        ]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env)
+        logger.info(f"LibreOffice stdout: {r.stdout[:200]}")
+        if r.stderr:
+            logger.warning(f"LibreOffice stderr: {r.stderr[:200]}")
 
         generated = pdf_path.parent / (docx_path.stem + ".pdf")
         if generated.exists() and generated != pdf_path:
             generated.rename(pdf_path)
-
         if not pdf_path.exists():
             raise FileNotFoundError("PDF non genere")
 
         logger.info(f"PDF OK : {pdf_path.stat().st_size // 1024} Ko")
-
     except subprocess.TimeoutExpired:
         raise RuntimeError("LibreOffice timeout 180s")
     except FileNotFoundError:
         raise RuntimeError(f"LibreOffice introuvable : {settings.LIBREOFFICE_PATH}")
-    finally:
-        script_path.unlink(missing_ok=True)
 
 
 def _count_pages(doc) -> int:
