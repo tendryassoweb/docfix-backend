@@ -1,10 +1,9 @@
 """
-processor.py v1.5
+processor.py v1.6
 Impulse AI — DocFix
 
-Fix critique : _heading_level stocké dans un dict partagé
-au lieu d'attributs Python temporaires sur les objets para
-(qui ne survivent pas aux appels asyncio.to_thread séparés)
+Fix: RGBColor n'a pas d'attributs .red/.green/.blue
+On passe les couleurs en hex string directement dans _force_run_formatting
 """
 
 import asyncio, logging, subprocess, time, re, os
@@ -23,13 +22,23 @@ from .ai_service import analyze_document, AIProvider
 
 logger = logging.getLogger("docfix.processor")
 
+# ── Couleurs en tuple (R, G, B) ET en hex string ─────────────────────────────
+# RGBColor pour python-docx styles
 COLOR_H1     = RGBColor(0x1F, 0x35, 0x64)
 COLOR_H2     = RGBColor(0x2E, 0x74, 0xB5)
 COLOR_H3     = RGBColor(0x40, 0x40, 0x40)
 COLOR_BODY   = RGBColor(0x26, 0x26, 0x26)
 COLOR_FOOTER = RGBColor(0x80, 0x80, 0x80)
-FONT_HEAD    = "Calibri"
-FONT_BODY    = "Calibri"
+
+# Hex string pour injection XML directe
+HEX_H1     = "1F3564"
+HEX_H2     = "2E74B5"
+HEX_H3     = "404040"
+HEX_BODY   = "262626"
+HEX_FOOTER = "808080"
+
+FONT_HEAD = "Calibri"
+FONT_BODY = "Calibri"
 
 
 async def process_document(job_id: str, input_path: Path):
@@ -62,26 +71,17 @@ async def process_document(job_id: str, input_path: Path):
         await asyncio.to_thread(_harmonize_fonts, doc)
         _step_done(job, "fonts", 34)
 
-        # ── Détection → retourne un dict {para_index: level} ──────────
         _step_start(job, "headings", "Detection des titres...")
-        heading_map = await asyncio.to_thread(
-            _detect_headings, doc, ai_result.data
-        )
+        heading_map = await asyncio.to_thread(_detect_headings, doc, ai_result.data)
         n_heads = len(heading_map)
-        logger.info(f"[{job_id}] heading_map={n_heads} entrées : {dict(list(heading_map.items())[:5])}")
+        logger.info(f"[{job_id}] {n_heads} titres detectes")
         _step_done(job, "headings", 44)
 
-        # ── Styles + couleurs + TOC — tout dans UN SEUL to_thread ─────
-        # On passe heading_map explicitement pour éviter
-        # la perte des attributs entre threads
-        _step_start(job, "styles", "Application styles, couleurs et TOC...")
-
-        toc_ok = await asyncio.to_thread(
-            _apply_all_formatting, doc, heading_map
-        )
+        # Tout le formatage + TOC dans un seul thread
+        _step_start(job, "styles", "Application styles et couleurs...")
+        toc_ok = await asyncio.to_thread(_apply_all_formatting, doc, heading_map)
         _step_done(job, "styles", 54)
 
-        # Marquer TOC done séparément pour le frontend
         job.set_step_done("toc")
         job.recalculate_progress()
         job.progress = max(job.progress, 63)
@@ -129,19 +129,13 @@ async def process_document(job_id: str, input_path: Path):
         input_path.unlink(missing_ok=True)
 
 
-# ── _apply_all_formatting : styles + TOC dans le même thread ────────────────
 def _apply_all_formatting(doc: Document, heading_map: dict) -> bool:
-    """
-    Regroupe setup_styles + apply_heading_styles + add_toc dans
-    un seul appel synchrone pour garantir que heading_map est accessible.
-    Retourne True si la TOC a été insérée.
-    """
+    """Styles + couleurs + TOC dans un seul thread synchrone."""
     _setup_styles(doc)
     _apply_heading_styles_with_map(doc, heading_map)
     return _add_toc_with_map(doc, heading_map)
 
 
-# ── Helpers progression ───────────────────────────────────────────────────────
 def _step_start(job, sid, msg):
     job.set_step_running(sid)
     job.current_step = msg
@@ -154,7 +148,6 @@ def _step_done(job, sid, pct):
         job.progress = pct
 
 
-# ── Nettoyage ─────────────────────────────────────────────────────────────────
 def _clean_whitespace(doc):
     prev_empty = False
     to_del = []
@@ -172,7 +165,6 @@ def _clean_whitespace(doc):
         p._element.getparent().remove(p._element)
 
 
-# ── Polices ───────────────────────────────────────────────────────────────────
 def _harmonize_fonts(doc):
     for para in doc.paragraphs:
         sn = para.style.name if para.style else ""
@@ -181,18 +173,15 @@ def _harmonize_fonts(doc):
         for run in para.runs:
             if run.font.size and run.font.size > Pt(14):
                 continue
-            run.font.name      = FONT_BODY
-            run.font.color.rgb = COLOR_BODY
+            run.font.name = FONT_BODY
             if not run.font.size or not (Pt(8) <= run.font.size <= Pt(14)):
                 run.font.size = Pt(11)
+            # Couleur via XML direct (évite l'erreur RGBColor)
+            _set_run_color(run, HEX_BODY)
 
 
-# ── Détection titres → dict {index_para: level} ───────────────────────────────
 def _detect_headings(doc: Document, ai_hints: dict) -> dict:
-    """
-    Retourne un dictionnaire {para_index: heading_level}.
-    On utilise l'index (int) comme clé — stable entre threads.
-    """
+    """Retourne {para_index: level}."""
     ai_map = {t["idx"]: t.get("level", 1) for t in ai_hints.get("likely_titles", [])}
     result = {}
 
@@ -202,8 +191,6 @@ def _detect_headings(doc: Document, ai_hints: dict) -> dict:
             continue
 
         sn = para.style.name if para.style else ""
-
-        # Déjà Heading dans le doc original
         if sn.startswith("Heading"):
             try:
                 lvl = int(sn.split()[-1])
@@ -212,10 +199,8 @@ def _detect_headings(doc: Document, ai_hints: dict) -> dict:
             result[i] = lvl
             continue
 
-        # Suggestion IA
         level = ai_map.get(i)
 
-        # Heuristique locale
         if level is None:
             short  = len(text) < 80
             no_dot = not text.endswith(".")
@@ -233,12 +218,12 @@ def _detect_headings(doc: Document, ai_hints: dict) -> dict:
         if level:
             result[i] = level
 
-    logger.info(f"_detect_headings : {len(result)} titres dans {len(doc.paragraphs)} paragraphes")
+    logger.info(f"_detect_headings: {len(result)} titres")
     return result
 
 
-# ── Setup styles Heading dans le document ────────────────────────────────────
 def _setup_styles(doc):
+    """Configure les styles Heading 1/2/3 avec RGBColor (API python-docx standard)."""
     cfgs = {
         "Heading 1": dict(size=Pt(18), color=COLOR_H1, bold=True,  italic=False,
                           caps=True,  before=Pt(24), after=Pt(8)),
@@ -255,7 +240,7 @@ def _setup_styles(doc):
                 st = doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
             st.font.name      = FONT_HEAD
             st.font.size      = c["size"]
-            st.font.color.rgb = c["color"]
+            st.font.color.rgb = c["color"]   # RGBColor OK ici
             st.font.bold      = c["bold"]
             st.font.italic    = c["italic"]
             if c["caps"]:
@@ -268,6 +253,7 @@ def _setup_styles(doc):
             pf.alignment         = WD_ALIGN_PARAGRAPH.LEFT
         except Exception as e:
             logger.warning(f"Style {name}: {e}")
+
     try:
         n = doc.styles["Normal"]
         n.font.name      = FONT_BODY
@@ -280,10 +266,9 @@ def _setup_styles(doc):
         pass
 
 
-# ── Appliquer styles + couleurs avec heading_map ─────────────────────────────
 def _apply_heading_styles_with_map(doc: Document, heading_map: dict):
-    color_map = {1: COLOR_H1,  2: COLOR_H2,  3: COLOR_H3}
-    size_map  = {1: Pt(18),    2: Pt(14),    3: Pt(12)}
+    hex_map  = {1: HEX_H1,  2: HEX_H2,  3: HEX_H3}
+    size_map = {1: Pt(18),  2: Pt(14),  3: Pt(12)}
 
     for i, para in enumerate(doc.paragraphs):
         lvl = heading_map.get(i)
@@ -301,11 +286,11 @@ def _apply_heading_styles_with_map(doc: Document, heading_map: dict):
         for run in para.runs:
             _force_run_formatting(
                 run,
-                color    = color_map[lvl],
-                size     = size_map[lvl],
-                bold     = True,
-                italic   = (lvl == 3),
-                all_caps = (lvl == 1),
+                hex_color = hex_map[lvl],
+                size      = size_map[lvl],
+                bold      = True,
+                italic    = (lvl == 3),
+                all_caps  = (lvl == 1),
             )
 
         # Espacement
@@ -316,12 +301,29 @@ def _apply_heading_styles_with_map(doc: Document, heading_map: dict):
 
         # Filet bleu sous H1
         if lvl == 1:
-            _set_para_border(para, "bottom", "1F3564", "8")
+            _set_para_border(para, "bottom", HEX_H1, "8")
 
 
-def _force_run_formatting(run, color: RGBColor, size: Pt,
+def _set_run_color(run, hex_color: str):
+    """Set couleur sur un run via XML direct."""
+    rpr = run._r.get_or_add_rPr()
+    color_el = rpr.find(qn("w:color"))
+    if color_el is None:
+        color_el = OxmlElement("w:color")
+        rpr.append(color_el)
+    color_el.set(qn("w:val"), hex_color)
+    # Supprimer themeColor
+    for attr in [qn("w:themeColor"), qn("w:themeTint"), qn("w:themeShade")]:
+        if attr in color_el.attrib:
+            del color_el.attrib[attr]
+
+
+def _force_run_formatting(run, hex_color: str, size: Pt,
                            bold=True, italic=False, all_caps=False):
-    """Force le formatage XML en supprimant les overrides thème Word."""
+    """
+    Force le formatage directement dans le XML du run.
+    Utilise hex_color (string) au lieu de RGBColor — évite l'erreur .red/.green/.blue
+    """
     rpr = run._r.get_or_add_rPr()
 
     # Police
@@ -361,14 +363,8 @@ def _force_run_formatting(run, color: RGBColor, size: Pt,
     elif not all_caps and caps_el is not None:
         rpr.remove(caps_el)
 
-    # Couleur — supprimer themeColor et forcer RGB
-    color_el = rpr.find(qn("w:color"))
-    if color_el is None:
-        color_el = OxmlElement("w:color"); rpr.append(color_el)
-    color_el.set(qn("w:val"), f"{color.red:02X}{color.green:02X}{color.blue:02X}")
-    for attr in [qn("w:themeColor"), qn("w:themeTint"), qn("w:themeShade")]:
-        if attr in color_el.attrib:
-            del color_el.attrib[attr]
+    # Couleur hex directe — pas de RGBColor ici
+    _set_run_color(run, hex_color)
 
     # Supprimer highlight
     hl = rpr.find(qn("w:highlight"))
@@ -389,15 +385,12 @@ def _set_para_border(para, side, color_hex, sz="6"):
     pPr.append(pBdr)
 
 
-# ── TOC avec heading_map ──────────────────────────────────────────────────────
 def _add_toc_with_map(doc: Document, heading_map: dict) -> bool:
-    """Insère la TOC. Utilise heading_map au lieu de _heading_level."""
     if not heading_map:
-        logger.warning(f"heading_map vide — TOC ignorée")
+        logger.warning("heading_map vide — TOC ignoree")
         return False
 
-    logger.info(f"_add_toc : {len(heading_map)} titres trouvés dans heading_map")
-
+    logger.info(f"_add_toc: {len(heading_map)} titres")
     first = next((p for p in doc.paragraphs if p.text.strip()), None)
 
     # Titre centré
@@ -411,7 +404,7 @@ def _add_toc_with_map(doc: Document, heading_map: dict) -> bool:
     title_r   = OxmlElement("w:r")
     title_rpr = OxmlElement("w:rPr")
     for tag, val in [("w:b", None), ("w:caps", None),
-                     ("w:sz", "32"), ("w:color", "1F3564")]:
+                     ("w:sz", "32"), ("w:color", HEX_H1)]:
         el = OxmlElement(tag)
         if val: el.set(qn("w:val"), val)
         title_rpr.append(el)
@@ -462,11 +455,10 @@ def _add_toc_with_map(doc: Document, heading_map: dict) -> bool:
         for el in elems:
             doc.element.body.append(el)
 
-    logger.info(f"TOC inseree avec {len(heading_map)} titres")
+    logger.info(f"TOC inseree — {len(heading_map)} titres")
     return True
 
 
-# ── Images ────────────────────────────────────────────────────────────────────
 def _fix_images(doc) -> int:
     MAX = Cm(14)
     NS  = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
@@ -491,7 +483,6 @@ def _fix_images(doc) -> int:
     return n
 
 
-# ── Pagination ────────────────────────────────────────────────────────────────
 def _add_pagination(doc):
     if not doc.sections:
         return
@@ -506,10 +497,12 @@ def _add_pagination(doc):
     fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
     _set_para_border(fp, "top", "CCCCCC", "4")
     r1 = fp.add_run("Impulse AI  |  DocFix          Page ")
-    r1.font.name = FONT_BODY; r1.font.size = Pt(8); r1.font.color.rgb = COLOR_FOOTER
+    r1.font.name = FONT_BODY; r1.font.size = Pt(8)
+    _set_run_color(r1, HEX_FOOTER)
     _add_field(fp, "PAGE")
     r2 = fp.add_run(" / ")
-    r2.font.name = FONT_BODY; r2.font.size = Pt(8); r2.font.color.rgb = COLOR_FOOTER
+    r2.font.name = FONT_BODY; r2.font.size = Pt(8)
+    _set_run_color(r2, HEX_FOOTER)
     _add_field(fp, "NUMPAGES")
 
 
@@ -518,7 +511,7 @@ def _add_field(para, name):
         r = OxmlElement("w:r")
         rpr = OxmlElement("w:rPr")
         sz  = OxmlElement("w:sz"); sz.set(qn("w:val"), "16")
-        col = OxmlElement("w:color"); col.set(qn("w:val"), "808080")
+        col = OxmlElement("w:color"); col.set(qn("w:val"), HEX_FOOTER)
         rpr.append(sz); rpr.append(col); r.append(rpr)
         if ftype:
             fc = OxmlElement("w:fldChar"); fc.set(qn("w:fldCharType"), ftype); r.append(fc)
@@ -528,7 +521,6 @@ def _add_field(para, name):
         para._p.append(r)
 
 
-# ── Conversion PDF ────────────────────────────────────────────────────────────
 def _to_pdf(docx_path: Path, pdf_path: Path):
     env = {**os.environ, "HOME": "/tmp", "DISPLAY": ""}
     cmd = [
@@ -540,19 +532,19 @@ def _to_pdf(docx_path: Path, pdf_path: Path):
     ]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env)
-        logger.info(f"LibreOffice stdout: {r.stdout[:300]}")
+        logger.info(f"LibreOffice: {r.stdout[:200]}")
         if r.stderr:
-            logger.warning(f"LibreOffice stderr: {r.stderr[:300]}")
+            logger.warning(f"LibreOffice stderr: {r.stderr[:200]}")
         generated = pdf_path.parent / (docx_path.stem + ".pdf")
         if generated.exists() and generated != pdf_path:
             generated.rename(pdf_path)
         if not pdf_path.exists():
             raise FileNotFoundError("PDF non genere")
-        logger.info(f"PDF OK : {pdf_path.stat().st_size // 1024} Ko")
+        logger.info(f"PDF OK: {pdf_path.stat().st_size // 1024} Ko")
     except subprocess.TimeoutExpired:
         raise RuntimeError("LibreOffice timeout 180s")
     except FileNotFoundError:
-        raise RuntimeError(f"LibreOffice introuvable : {settings.LIBREOFFICE_PATH}")
+        raise RuntimeError(f"LibreOffice introuvable: {settings.LIBREOFFICE_PATH}")
 
 
 def _count_pages(doc) -> int:
