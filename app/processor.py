@@ -1,18 +1,19 @@
 """
-processor.py v1.7
+processor.py v1.8
 Impulse AI — DocFix
 
-Fix TOC : génération manuelle avec python-docx
-(LibreOffice headless ne met pas à jour les champs Word)
-Fix footer : suppression mention Impulse AI
+Fixes:
+- Suppression import Tab inexistant
+- Heading 1 centré
+- Traitement des tableaux (bordures, polices, en-tête coloré)
 """
 
 import asyncio, logging, subprocess, time, re, os
 from pathlib import Path
 
 from docx import Document
-from docx.shared import Pt, Cm, RGBColor, Tab
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, WD_TAB_ALIGNMENT, WD_TAB_LEADER
+from docx.shared import Pt, Cm, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.enum.style import WD_STYLE_TYPE
@@ -29,11 +30,13 @@ COLOR_H3     = RGBColor(0x40, 0x40, 0x40)
 COLOR_BODY   = RGBColor(0x26, 0x26, 0x26)
 COLOR_FOOTER = RGBColor(0x80, 0x80, 0x80)
 
-HEX_H1     = "1F3564"
-HEX_H2     = "2E74B5"
-HEX_H3     = "404040"
-HEX_BODY   = "262626"
-HEX_FOOTER = "808080"
+HEX_H1       = "1F3564"
+HEX_H2       = "2E74B5"
+HEX_H3       = "404040"
+HEX_BODY     = "262626"
+HEX_FOOTER   = "808080"
+HEX_TBL_HEAD = "1F3564"   # fond en-tête tableau
+HEX_TBL_ALT  = "EEF3FA"   # fond lignes alternées (bleu très clair)
 
 FONT_HEAD = "Calibri"
 FONT_BODY = "Calibri"
@@ -76,7 +79,7 @@ async def process_document(job_id: str, input_path: Path):
         _step_done(job, "headings", 44)
 
         # Styles + couleurs + TOC dans un seul thread
-        _step_start(job, "styles", "Application styles et couleurs...")
+        _step_start(job, "styles", "Application styles, couleurs et TOC...")
         toc_ok = await asyncio.to_thread(_apply_all_formatting, doc, heading_map)
         _step_done(job, "styles", 54)
 
@@ -86,10 +89,13 @@ async def process_document(job_id: str, input_path: Path):
 
         _step_start(job, "images", "Redimensionnement images...")
         n_img = await asyncio.to_thread(_fix_images, doc)
-        _step_done(job, "images", 71)
+        _step_done(job, "images", 69)
 
-        _step_start(job, "pagination", "Pagination...")
+        # Tableaux
+        _step_start(job, "pagination", "Mise en forme des tableaux et pagination...")
+        n_tables = await asyncio.to_thread(_format_tables, doc)
         await asyncio.to_thread(_add_pagination, doc)
+        logger.info(f"[{job_id}] {n_tables} tableaux formates")
         _step_done(job, "pagination", 79)
 
         _step_start(job, "export_docx", "Sauvegarde DOCX...")
@@ -105,6 +111,7 @@ async def process_document(job_id: str, input_path: Path):
             "pagesCount":       _count_pages(doc),
             "headingsDetected": n_heads,
             "imagesFixed":      n_img,
+            "tablesFormatted":  n_tables,
             "fontsHarmonized":  1,
             "durationSeconds":  duration,
             "aiProvider":       ai_result.provider.value,
@@ -113,7 +120,7 @@ async def process_document(job_id: str, input_path: Path):
         job.status       = "done"
         job.progress     = 100
         job.current_step = "Traitement termine"
-        logger.info(f"Job {job_id} OK en {duration}s — heads={n_heads} toc={toc_ok}")
+        logger.info(f"Job {job_id} OK en {duration}s — heads={n_heads} toc={toc_ok} tables={n_tables}")
 
     except Exception as exc:
         logger.error(f"Erreur job {job_id}: {exc}", exc_info=True)
@@ -145,6 +152,7 @@ def _step_done(job, sid, pct):
         job.progress = pct
 
 
+# ── Nettoyage ─────────────────────────────────────────────────────────────────
 def _clean_whitespace(doc):
     prev_empty = False
     to_del = []
@@ -162,6 +170,7 @@ def _clean_whitespace(doc):
         p._element.getparent().remove(p._element)
 
 
+# ── Polices ───────────────────────────────────────────────────────────────────
 def _harmonize_fonts(doc):
     for para in doc.paragraphs:
         sn = para.style.name if para.style else ""
@@ -176,6 +185,7 @@ def _harmonize_fonts(doc):
             _set_run_color(run, HEX_BODY)
 
 
+# ── Détection titres ──────────────────────────────────────────────────────────
 def _detect_headings(doc: Document, ai_hints: dict) -> dict:
     ai_map = {t["idx"]: t.get("level", 1) for t in ai_hints.get("likely_titles", [])}
     result = {}
@@ -210,14 +220,18 @@ def _detect_headings(doc: Document, ai_hints: dict) -> dict:
     return result
 
 
+# ── Setup styles ──────────────────────────────────────────────────────────────
 def _setup_styles(doc):
     cfgs = {
         "Heading 1": dict(size=Pt(18), color=COLOR_H1, bold=True,  italic=False,
-                          caps=True,  before=Pt(24), after=Pt(8)),
+                          caps=True,  before=Pt(24), after=Pt(8),
+                          align=WD_ALIGN_PARAGRAPH.CENTER),   # ← CENTRÉ
         "Heading 2": dict(size=Pt(14), color=COLOR_H2, bold=True,  italic=False,
-                          caps=False, before=Pt(16), after=Pt(6)),
+                          caps=False, before=Pt(16), after=Pt(6),
+                          align=WD_ALIGN_PARAGRAPH.LEFT),
         "Heading 3": dict(size=Pt(12), color=COLOR_H3, bold=True,  italic=True,
-                          caps=False, before=Pt(12), after=Pt(4)),
+                          caps=False, before=Pt(12), after=Pt(4),
+                          align=WD_ALIGN_PARAGRAPH.LEFT),
     }
     for name, c in cfgs.items():
         try:
@@ -235,9 +249,9 @@ def _setup_styles(doc):
             pf = st.paragraph_format
             pf.space_before      = c["before"]
             pf.space_after       = c["after"]
+            pf.alignment         = c["align"]
             pf.keep_with_next    = True
             pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
-            pf.alignment         = WD_ALIGN_PARAGRAPH.LEFT
         except Exception as e:
             logger.warning(f"Style {name}: {e}")
     try:
@@ -252,18 +266,32 @@ def _setup_styles(doc):
         pass
 
 
+# ── Appliquer styles sur chaque titre ────────────────────────────────────────
 def _apply_heading_styles_with_map(doc: Document, heading_map: dict):
-    hex_map  = {1: HEX_H1,  2: HEX_H2,  3: HEX_H3}
-    size_map = {1: Pt(18),  2: Pt(14),  3: Pt(12)}
+    hex_map   = {1: HEX_H1,  2: HEX_H2,  3: HEX_H3}
+    size_map  = {1: Pt(18),  2: Pt(14),  3: Pt(12)}
+    align_map = {
+        1: WD_ALIGN_PARAGRAPH.CENTER,   # H1 centré
+        2: WD_ALIGN_PARAGRAPH.LEFT,
+        3: WD_ALIGN_PARAGRAPH.LEFT,
+    }
+
     for i, para in enumerate(doc.paragraphs):
         lvl = heading_map.get(i)
         if not lvl:
             continue
         lvl = min(lvl, 3)
+
+        # Style paragraphe
         try:
             para.style = doc.styles[f"Heading {lvl}"]
         except KeyError:
             pass
+
+        # Alignement direct sur le paragraphe
+        para.paragraph_format.alignment = align_map[lvl]
+
+        # Forcer couleur + taille sur chaque run
         for run in para.runs:
             _force_run_formatting(
                 run,
@@ -273,14 +301,19 @@ def _apply_heading_styles_with_map(doc: Document, heading_map: dict):
                 italic    = (lvl == 3),
                 all_caps  = (lvl == 1),
             )
+
+        # Espacement
         pf = para.paragraph_format
         pf.space_before   = {1: Pt(24), 2: Pt(16), 3: Pt(12)}[lvl]
         pf.space_after    = {1: Pt(8),  2: Pt(6),  3: Pt(4)}[lvl]
         pf.keep_with_next = True
+
+        # Filet sous H1
         if lvl == 1:
             _set_para_border(para, "bottom", HEX_H1, "8")
 
 
+# ── Helpers XML ───────────────────────────────────────────────────────────────
 def _set_run_color(run, hex_color: str):
     rpr = run._r.get_or_add_rPr()
     color_el = rpr.find(qn("w:color"))
@@ -308,13 +341,13 @@ def _force_run_formatting(run, hex_color: str, size: Pt,
             el = OxmlElement(tag); rpr.append(el)
         el.set(qn("w:val"), half)
     b = rpr.find(qn("w:b"))
-    if bold and b is None:    rpr.append(OxmlElement("w:b"))
+    if bold and b is None:           rpr.append(OxmlElement("w:b"))
     elif not bold and b is not None: rpr.remove(b)
     i_el = rpr.find(qn("w:i"))
-    if italic and i_el is None:      rpr.append(OxmlElement("w:i"))
+    if italic and i_el is None:           rpr.append(OxmlElement("w:i"))
     elif not italic and i_el is not None: rpr.remove(i_el)
     caps_el = rpr.find(qn("w:caps"))
-    if all_caps and caps_el is None:      rpr.append(OxmlElement("w:caps"))
+    if all_caps and caps_el is None:           rpr.append(OxmlElement("w:caps"))
     elif not all_caps and caps_el is not None: rpr.remove(caps_el)
     _set_run_color(run, hex_color)
     hl = rpr.find(qn("w:highlight"))
@@ -333,84 +366,59 @@ def _set_para_border(para, side, color_hex, sz="6"):
     pPr.append(pBdr)
 
 
-# ── TOC MANUELLE ──────────────────────────────────────────────────────────────
+# ── TOC manuelle ──────────────────────────────────────────────────────────────
 def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
-    """
-    Génère la table des matières MANUELLEMENT avec python-docx.
-    On lit les titres détectés et on écrit chaque ligne de TOC
-    directement comme paragraphe formaté avec points de suite.
-    Fonctionne dans tous les environnements (LibreOffice, Word, PDF).
-    """
     if not heading_map:
         logger.warning("heading_map vide — TOC ignoree")
         return False
 
-    # Collecter les titres dans l'ordre du document
     toc_entries = []
     for i, para in enumerate(doc.paragraphs):
         lvl = heading_map.get(i)
         if lvl:
-            toc_entries.append({
-                "level": min(lvl, 3),
-                "text":  para.text.strip(),
-            })
+            toc_entries.append({"level": min(lvl, 3), "text": para.text.strip()})
 
     if not toc_entries:
-        logger.warning("Aucune entrée TOC — ignoree")
         return False
 
-    logger.info(f"TOC manuelle : {len(toc_entries)} entrees")
-
-    # Trouver le premier paragraphe pour insérer avant
     first = next((p for p in doc.paragraphs if p.text.strip()), None)
-
-    # Construire les éléments XML de la TOC
     toc_elements = []
 
-    # ── Titre "TABLE DES MATIÈRES" ────────────────────────────────
+    # Titre centré
     title_p   = OxmlElement("w:p")
     title_ppr = OxmlElement("w:pPr")
     jc = OxmlElement("w:jc"); jc.set(qn("w:val"), "center")
     sp = OxmlElement("w:spacing")
     sp.set(qn("w:before"), "480"); sp.set(qn("w:after"), "360")
-    title_ppr.append(jc); title_ppr.append(sp)
+    pBdr = OxmlElement("w:pBdr")
+    bot  = OxmlElement("w:bottom")
+    bot.set(qn("w:val"), "single"); bot.set(qn("w:sz"), "8")
+    bot.set(qn("w:space"), "4");    bot.set(qn("w:color"), HEX_H1)
+    pBdr.append(bot)
+    title_ppr.append(jc); title_ppr.append(sp); title_ppr.append(pBdr)
     title_p.append(title_ppr)
     title_r   = OxmlElement("w:r")
     title_rpr = OxmlElement("w:rPr")
-    for tag, val in [("w:b", None), ("w:caps", None),
-                     ("w:sz", "32"), ("w:color", HEX_H1),
-                     ("w:rFonts", None)]:
+    for tag, val in [("w:b", None), ("w:caps", None), ("w:sz", "32"), ("w:color", HEX_H1)]:
         el = OxmlElement(tag)
-        if val:
-            el.set(qn("w:val"), val)
-        if tag == "w:rFonts":
-            el.set(qn("w:ascii"), FONT_HEAD)
-            el.set(qn("w:hAnsi"), FONT_HEAD)
+        if val: el.set(qn("w:val"), val)
         title_rpr.append(el)
+    rf = OxmlElement("w:rFonts")
+    rf.set(qn("w:ascii"), FONT_HEAD); rf.set(qn("w:hAnsi"), FONT_HEAD)
+    title_rpr.append(rf)
     title_r.append(title_rpr)
     title_t = OxmlElement("w:t"); title_t.text = "Table des matieres"
     title_r.append(title_t); title_p.append(title_r)
     toc_elements.append(title_p)
 
-    # Filet sous le titre
-    title_ppr2 = title_p.find(qn("w:pPr"))
-    if title_ppr2 is not None:
-        pBdr = OxmlElement("w:pBdr")
-        bot  = OxmlElement("w:bottom")
-        bot.set(qn("w:val"), "single"); bot.set(qn("w:sz"), "8")
-        bot.set(qn("w:space"), "4");    bot.set(qn("w:color"), HEX_H1)
-        pBdr.append(bot)
-        title_ppr2.append(pBdr)
-
-    # ── Lignes de TOC ─────────────────────────────────────────────
-    # Config par niveau
+    # Lignes de TOC
     level_cfg = {
-        1: {"indent": 0,    "font_size": "22", "bold": True,  "color": HEX_H1,
-            "space_before": "120", "space_after": "60"},
-        2: {"indent": 360,  "font_size": "20", "bold": False, "color": HEX_H2,
-            "space_before": "60",  "space_after": "40"},
-        3: {"indent": 720,  "font_size": "18", "bold": False, "color": HEX_H3,
-            "space_before": "40",  "space_after": "20"},
+        1: {"indent": "0",   "font_size": "22", "bold": True,  "color": HEX_H1,
+            "before": "120", "after": "60"},
+        2: {"indent": "360", "font_size": "20", "bold": False, "color": HEX_H2,
+            "before": "60",  "after": "40"},
+        3: {"indent": "720", "font_size": "18", "bold": False, "color": HEX_H3,
+            "before": "40",  "after": "20"},
     }
 
     for entry in toc_entries:
@@ -421,71 +429,55 @@ def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
         toc_p   = OxmlElement("w:p")
         toc_ppr = OxmlElement("w:pPr")
 
-        # Indentation selon le niveau
-        ind = OxmlElement("w:ind")
-        ind.set(qn("w:left"), str(cfg["indent"]))
+        ind = OxmlElement("w:ind"); ind.set(qn("w:left"), cfg["indent"])
         toc_ppr.append(ind)
 
-        # Espacement
         sp2 = OxmlElement("w:spacing")
-        sp2.set(qn("w:before"), cfg["space_before"])
-        sp2.set(qn("w:after"),  cfg["space_after"])
+        sp2.set(qn("w:before"), cfg["before"]); sp2.set(qn("w:after"), cfg["after"])
         toc_ppr.append(sp2)
 
-        # Tab stop à droite avec points de suite (........ )
+        # Tab stop avec points de suite
         tabs = OxmlElement("w:tabs")
         tab  = OxmlElement("w:tab")
-        tab.set(qn("w:val"),    "right")
-        tab.set(qn("w:leader"), "dot")    # points de suite
-        tab.set(qn("w:pos"),    "8640")   # position ~15cm
-        tabs.append(tab)
-        toc_ppr.append(tabs)
-
+        tab.set(qn("w:val"), "right"); tab.set(qn("w:leader"), "dot")
+        tab.set(qn("w:pos"), "8640")
+        tabs.append(tab); toc_ppr.append(tabs)
         toc_p.append(toc_ppr)
 
-        # Run : texte du titre
-        r_text   = OxmlElement("w:r")
-        r_rpr    = OxmlElement("w:rPr")
-        r_sz     = OxmlElement("w:sz");    r_sz.set(qn("w:val"), cfg["font_size"])
-        r_color  = OxmlElement("w:color"); r_color.set(qn("w:val"), cfg["color"])
-        r_fonts  = OxmlElement("w:rFonts")
-        r_fonts.set(qn("w:ascii"), FONT_HEAD)
-        r_fonts.set(qn("w:hAnsi"), FONT_HEAD)
-        r_rpr.append(r_fonts); r_rpr.append(r_sz); r_rpr.append(r_color)
-        if cfg["bold"]:
-            r_rpr.append(OxmlElement("w:b"))
+        # Texte titre
+        r_text  = OxmlElement("w:r")
+        r_rpr   = OxmlElement("w:rPr")
+        r_sz    = OxmlElement("w:sz");    r_sz.set(qn("w:val"), cfg["font_size"])
+        r_col   = OxmlElement("w:color"); r_col.set(qn("w:val"), cfg["color"])
+        r_fonts = OxmlElement("w:rFonts")
+        r_fonts.set(qn("w:ascii"), FONT_HEAD); r_fonts.set(qn("w:hAnsi"), FONT_HEAD)
+        r_rpr.append(r_fonts); r_rpr.append(r_sz); r_rpr.append(r_col)
+        if cfg["bold"]: r_rpr.append(OxmlElement("w:b"))
         r_text.append(r_rpr)
         r_t = OxmlElement("w:t")
-        r_t.set(qn("xml:space"), "preserve")
-        r_t.text = text
-        r_text.append(r_t)
-        toc_p.append(r_text)
+        r_t.set(qn("xml:space"), "preserve"); r_t.text = text
+        r_text.append(r_t); toc_p.append(r_text)
 
-        # Run : tab + numéro de page (placeholder "—")
-        r_pg    = OxmlElement("w:r")
+        # Tab + tiret (numéro de page non disponible en headless)
+        r_pg     = OxmlElement("w:r")
         r_pg_rpr = OxmlElement("w:rPr")
         r_pg_sz  = OxmlElement("w:sz");    r_pg_sz.set(qn("w:val"), cfg["font_size"])
         r_pg_col = OxmlElement("w:color"); r_pg_col.set(qn("w:val"), HEX_H3)
         r_pg_rpr.append(r_pg_sz); r_pg_rpr.append(r_pg_col)
         r_pg.append(r_pg_rpr)
-        # Tabulation
-        tab_el = OxmlElement("w:tab")
-        r_pg.append(tab_el)
-        # Numéro de page (on met "—" car LibreOffice ne met pas à jour PAGE refs)
+        r_pg.append(OxmlElement("w:tab"))
         pg_t = OxmlElement("w:t"); pg_t.text = "—"
-        r_pg.append(pg_t)
-        toc_p.append(r_pg)
+        r_pg.append(pg_t); toc_p.append(r_pg)
 
         toc_elements.append(toc_p)
 
-    # Saut de page après la TOC
+    # Saut de page
     pb_p = OxmlElement("w:p")
     pb_r = OxmlElement("w:r")
     pb_e = OxmlElement("w:br"); pb_e.set(qn("w:type"), "page")
     pb_r.append(pb_e); pb_p.append(pb_r)
     toc_elements.append(pb_p)
 
-    # Insérer avant le premier paragraphe
     if first is not None:
         ref = first._element
         par = ref.getparent()
@@ -500,6 +492,91 @@ def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
     return True
 
 
+# ── Tableaux ──────────────────────────────────────────────────────────────────
+def _format_tables(doc: Document) -> int:
+    """
+    Pour chaque tableau du document :
+    - Bordures fines sur toutes les cellules
+    - Première ligne (en-tête) : fond bleu marine, texte blanc, gras
+    - Lignes alternées : fond bleu très clair
+    - Police harmonisée
+    """
+    count = 0
+    for table in doc.tables:
+        try:
+            _style_table(table)
+            count += 1
+        except Exception as e:
+            logger.warning(f"Tableau ignoré: {e}")
+    return count
+
+
+def _style_table(table):
+    """Applique le style pro sur un tableau."""
+    for row_idx, row in enumerate(table.rows):
+        is_header = (row_idx == 0)
+        is_alt    = (row_idx % 2 == 0) and not is_header
+
+        for cell in row.cells:
+            # ── Fond de cellule ──────────────────────────────────
+            if is_header:
+                _set_cell_background(cell, HEX_TBL_HEAD)
+            elif is_alt:
+                _set_cell_background(cell, HEX_TBL_ALT)
+            else:
+                _set_cell_background(cell, "FFFFFF")
+
+            # ── Bordures de cellule ──────────────────────────────
+            _set_cell_borders(cell)
+
+            # ── Texte de la cellule ──────────────────────────────
+            for para in cell.paragraphs:
+                para.paragraph_format.space_before = Pt(2)
+                para.paragraph_format.space_after  = Pt(2)
+                for run in para.runs:
+                    run.font.name = FONT_BODY
+                    run.font.size = Pt(10)
+                    if is_header:
+                        run.font.bold = True
+                        _set_run_color(run, "FFFFFF")
+                    else:
+                        run.font.bold = False
+                        _set_run_color(run, HEX_BODY)
+
+
+def _set_cell_background(cell, hex_color: str):
+    """Définit la couleur de fond d'une cellule."""
+    tc   = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    shd  = tcPr.find(qn("w:shd"))
+    if shd is None:
+        shd = OxmlElement("w:shd")
+        tcPr.append(shd)
+    shd.set(qn("w:val"),   "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"),  hex_color)
+
+
+def _set_cell_borders(cell):
+    """Bordures fines grises sur toutes les cellules."""
+    tc   = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    tcBorders = tcPr.find(qn("w:tcBorders"))
+    if tcBorders is None:
+        tcBorders = OxmlElement("w:tcBorders")
+        tcPr.append(tcBorders)
+    for side in ["top", "left", "bottom", "right", "insideH", "insideV"]:
+        el = tcBorders.find(qn(f"w:{side}"))
+        if el is None:
+            el = OxmlElement(f"w:{side}")
+            tcBorders.append(el)
+        el.set(qn("w:val"),   "single")
+        el.set(qn("w:sz"),    "4")
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), "BFBFBF")
+
+
+# ── Images ────────────────────────────────────────────────────────────────────
 def _fix_images(doc) -> int:
     MAX = Cm(14)
     NS  = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
@@ -524,8 +601,8 @@ def _fix_images(doc) -> int:
     return n
 
 
+# ── Pagination ────────────────────────────────────────────────────────────────
 def _add_pagination(doc):
-    """Pied de page : juste le numéro de page centré, sans mention Impulse AI."""
     if not doc.sections:
         return
     for sec in doc.sections:
@@ -538,21 +615,16 @@ def _add_pagination(doc):
     fp = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
     fp.clear()
     fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    # Filet fin au-dessus
     _set_para_border(fp, "top", "CCCCCC", "4")
 
-    # "Page X / Y" centré — sans mention société
     r1 = fp.add_run("Page ")
-    r1.font.name = FONT_BODY
-    r1.font.size = Pt(9)
+    r1.font.name = FONT_BODY; r1.font.size = Pt(9)
     _set_run_color(r1, HEX_FOOTER)
 
     _add_field(fp, "PAGE")
 
     r2 = fp.add_run(" / ")
-    r2.font.name = FONT_BODY
-    r2.font.size = Pt(9)
+    r2.font.name = FONT_BODY; r2.font.size = Pt(9)
     _set_run_color(r2, HEX_FOOTER)
 
     _add_field(fp, "NUMPAGES")
@@ -573,6 +645,7 @@ def _add_field(para, name):
         para._p.append(r)
 
 
+# ── PDF ───────────────────────────────────────────────────────────────────────
 def _to_pdf(docx_path: Path, pdf_path: Path):
     env = {**os.environ, "HOME": "/tmp", "DISPLAY": ""}
     cmd = [
