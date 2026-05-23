@@ -1,11 +1,11 @@
 """
-processor.py v1.8
+processor.py v1.9
 Impulse AI — DocFix
 
-Fixes:
-- Suppression import Tab inexistant
-- Heading 1 centré
-- Traitement des tableaux (bordures, polices, en-tête coloré)
+Nouveautés :
+- Suppression des pages blanches superflues
+- Numéro de page configurable (start_page)
+- Table des matières optionnelle (include_toc)
 """
 
 import asyncio, logging, subprocess, time, re, os
@@ -35,14 +35,28 @@ HEX_H2       = "2E74B5"
 HEX_H3       = "404040"
 HEX_BODY     = "262626"
 HEX_FOOTER   = "808080"
-HEX_TBL_HEAD = "1F3564"   # fond en-tête tableau
-HEX_TBL_ALT  = "EEF3FA"   # fond lignes alternées (bleu très clair)
+HEX_TBL_HEAD = "1F3564"
+HEX_TBL_ALT  = "EEF3FA"
 
 FONT_HEAD = "Calibri"
 FONT_BODY = "Calibri"
 
 
-async def process_document(job_id: str, input_path: Path):
+async def process_document(
+    job_id: str,
+    input_path: Path,
+    start_page: int = 1,
+    include_toc: bool = True,
+):
+    """
+    Traitement principal.
+    
+    Args:
+        job_id      : identifiant du job
+        input_path  : chemin du fichier DOCX source
+        start_page  : numéro de la première page (défaut: 1)
+        include_toc : inclure la table des matières (défaut: True)
+    """
     job = job_store.get(job_id)
     if not job:
         return
@@ -64,8 +78,9 @@ async def process_document(job_id: str, input_path: Path):
         ai_result = await analyze_document(doc, job_id)
         _step_done(job, "ai", 18)
 
-        _step_start(job, "clean", "Nettoyage des espaces...")
+        _step_start(job, "clean", "Nettoyage espaces et pages blanches...")
         await asyncio.to_thread(_clean_whitespace, doc)
+        await asyncio.to_thread(_remove_blank_pages, doc)
         _step_done(job, "clean", 26)
 
         _step_start(job, "fonts", "Harmonisation des polices...")
@@ -79,8 +94,10 @@ async def process_document(job_id: str, input_path: Path):
         _step_done(job, "headings", 44)
 
         # Styles + couleurs + TOC dans un seul thread
-        _step_start(job, "styles", "Application styles, couleurs et TOC...")
-        toc_ok = await asyncio.to_thread(_apply_all_formatting, doc, heading_map)
+        _step_start(job, "styles", "Application styles et couleurs...")
+        toc_ok = await asyncio.to_thread(
+            _apply_all_formatting, doc, heading_map, include_toc
+        )
         _step_done(job, "styles", 54)
 
         job.set_step_done("toc")
@@ -91,11 +108,10 @@ async def process_document(job_id: str, input_path: Path):
         n_img = await asyncio.to_thread(_fix_images, doc)
         _step_done(job, "images", 69)
 
-        # Tableaux
-        _step_start(job, "pagination", "Mise en forme des tableaux et pagination...")
+        _step_start(job, "pagination", "Tableaux et pagination...")
         n_tables = await asyncio.to_thread(_format_tables, doc)
-        await asyncio.to_thread(_add_pagination, doc)
-        logger.info(f"[{job_id}] {n_tables} tableaux formates")
+        await asyncio.to_thread(_add_pagination, doc, start_page)
+        logger.info(f"[{job_id}] {n_tables} tableaux formates, pagination depuis page {start_page}")
         _step_done(job, "pagination", 79)
 
         _step_start(job, "export_docx", "Sauvegarde DOCX...")
@@ -116,11 +132,12 @@ async def process_document(job_id: str, input_path: Path):
             "durationSeconds":  duration,
             "aiProvider":       ai_result.provider.value,
             "tocInserted":      toc_ok,
+            "startPage":        start_page,
         }
         job.status       = "done"
         job.progress     = 100
         job.current_step = "Traitement termine"
-        logger.info(f"Job {job_id} OK en {duration}s — heads={n_heads} toc={toc_ok} tables={n_tables}")
+        logger.info(f"Job {job_id} OK en {duration}s")
 
     except Exception as exc:
         logger.error(f"Erreur job {job_id}: {exc}", exc_info=True)
@@ -134,10 +151,12 @@ async def process_document(job_id: str, input_path: Path):
         input_path.unlink(missing_ok=True)
 
 
-def _apply_all_formatting(doc: Document, heading_map: dict) -> bool:
+def _apply_all_formatting(doc: Document, heading_map: dict, include_toc: bool) -> bool:
     _setup_styles(doc)
     _apply_heading_styles_with_map(doc, heading_map)
-    return _add_toc_manual(doc, heading_map)
+    if include_toc:
+        return _add_toc_manual(doc, heading_map)
+    return False
 
 
 def _step_start(job, sid, msg):
@@ -152,7 +171,7 @@ def _step_done(job, sid, pct):
         job.progress = pct
 
 
-# ── Nettoyage ─────────────────────────────────────────────────────────────────
+# ── Nettoyage espaces ─────────────────────────────────────────────────────────
 def _clean_whitespace(doc):
     prev_empty = False
     to_del = []
@@ -168,6 +187,69 @@ def _clean_whitespace(doc):
             prev_empty = False
     for p in to_del:
         p._element.getparent().remove(p._element)
+
+
+# ── Suppression pages blanches ────────────────────────────────────────────────
+def _remove_blank_pages(doc: Document):
+    """
+    Supprime les sauts de page consécutifs qui créent des pages blanches.
+    Stratégie : détecter les paragraphes qui ne contiennent QUE
+    un saut de page (w:br type=page) et les supprimer si le paragraphe
+    précédent ou suivant contient aussi un saut de page.
+    """
+    # Collecter tous les paragraphes avec saut de page uniquement
+    page_break_paras = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            continue  # contient du texte réel → garder
+        # Chercher un w:br type=page
+        has_page_break = False
+        for run in para.runs:
+            for br in run._element.findall(qn("w:br")):
+                if br.get(qn("w:type")) == "page":
+                    has_page_break = True
+                    break
+        # Chercher aussi dans les éléments directs du paragraphe
+        for br in para._element.iter(qn("w:br")):
+            if br.get(qn("w:type")) == "page":
+                has_page_break = True
+                break
+        if has_page_break:
+            page_break_paras.append(para)
+
+    # Supprimer les sauts de page consécutifs (garder le premier)
+    to_del = []
+    paras_list = list(doc.paragraphs)
+    for i, para in enumerate(paras_list):
+        if para not in page_break_paras:
+            continue
+        # Si le paragraphe précédent est aussi un saut de page → supprimer celui-ci
+        if i > 0 and paras_list[i-1] in page_break_paras:
+            to_del.append(para)
+
+    for para in to_del:
+        para._element.getparent().remove(para._element)
+
+    if to_del:
+        logger.info(f"Pages blanches supprimees : {len(to_del)}")
+
+    # Supprimer aussi les paragraphes vides en fin de document
+    _remove_trailing_empty_paras(doc)
+
+
+def _remove_trailing_empty_paras(doc: Document):
+    """Supprime les paragraphes vides en fin de document."""
+    paras = list(doc.paragraphs)
+    to_del = []
+    for para in reversed(paras):
+        if not para.text.strip():
+            to_del.append(para)
+        else:
+            break  # dès qu'on trouve du contenu on s'arrête
+    # Garder au moins un paragraphe final
+    for para in to_del[:-1] if len(to_del) > 1 else []:
+        para._element.getparent().remove(para._element)
 
 
 # ── Polices ───────────────────────────────────────────────────────────────────
@@ -225,7 +307,7 @@ def _setup_styles(doc):
     cfgs = {
         "Heading 1": dict(size=Pt(18), color=COLOR_H1, bold=True,  italic=False,
                           caps=True,  before=Pt(24), after=Pt(8),
-                          align=WD_ALIGN_PARAGRAPH.CENTER),   # ← CENTRÉ
+                          align=WD_ALIGN_PARAGRAPH.CENTER),
         "Heading 2": dict(size=Pt(14), color=COLOR_H2, bold=True,  italic=False,
                           caps=False, before=Pt(16), after=Pt(6),
                           align=WD_ALIGN_PARAGRAPH.LEFT),
@@ -266,32 +348,25 @@ def _setup_styles(doc):
         pass
 
 
-# ── Appliquer styles sur chaque titre ────────────────────────────────────────
+# ── Appliquer styles ──────────────────────────────────────────────────────────
 def _apply_heading_styles_with_map(doc: Document, heading_map: dict):
     hex_map   = {1: HEX_H1,  2: HEX_H2,  3: HEX_H3}
     size_map  = {1: Pt(18),  2: Pt(14),  3: Pt(12)}
     align_map = {
-        1: WD_ALIGN_PARAGRAPH.CENTER,   # H1 centré
+        1: WD_ALIGN_PARAGRAPH.CENTER,
         2: WD_ALIGN_PARAGRAPH.LEFT,
         3: WD_ALIGN_PARAGRAPH.LEFT,
     }
-
     for i, para in enumerate(doc.paragraphs):
         lvl = heading_map.get(i)
         if not lvl:
             continue
         lvl = min(lvl, 3)
-
-        # Style paragraphe
         try:
             para.style = doc.styles[f"Heading {lvl}"]
         except KeyError:
             pass
-
-        # Alignement direct sur le paragraphe
         para.paragraph_format.alignment = align_map[lvl]
-
-        # Forcer couleur + taille sur chaque run
         for run in para.runs:
             _force_run_formatting(
                 run,
@@ -301,14 +376,10 @@ def _apply_heading_styles_with_map(doc: Document, heading_map: dict):
                 italic    = (lvl == 3),
                 all_caps  = (lvl == 1),
             )
-
-        # Espacement
         pf = para.paragraph_format
         pf.space_before   = {1: Pt(24), 2: Pt(16), 3: Pt(12)}[lvl]
         pf.space_after    = {1: Pt(8),  2: Pt(6),  3: Pt(4)}[lvl]
         pf.keep_with_next = True
-
-        # Filet sous H1
         if lvl == 1:
             _set_para_border(para, "bottom", HEX_H1, "8")
 
@@ -318,8 +389,7 @@ def _set_run_color(run, hex_color: str):
     rpr = run._r.get_or_add_rPr()
     color_el = rpr.find(qn("w:color"))
     if color_el is None:
-        color_el = OxmlElement("w:color")
-        rpr.append(color_el)
+        color_el = OxmlElement("w:color"); rpr.append(color_el)
     color_el.set(qn("w:val"), hex_color)
     for attr in [qn("w:themeColor"), qn("w:themeTint"), qn("w:themeShade")]:
         if attr in color_el.attrib:
@@ -369,22 +439,19 @@ def _set_para_border(para, side, color_hex, sz="6"):
 # ── TOC manuelle ──────────────────────────────────────────────────────────────
 def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
     if not heading_map:
-        logger.warning("heading_map vide — TOC ignoree")
         return False
-
     toc_entries = []
     for i, para in enumerate(doc.paragraphs):
         lvl = heading_map.get(i)
         if lvl:
             toc_entries.append({"level": min(lvl, 3), "text": para.text.strip()})
-
     if not toc_entries:
         return False
 
     first = next((p for p in doc.paragraphs if p.text.strip()), None)
     toc_elements = []
 
-    # Titre centré
+    # Titre centré avec filet
     title_p   = OxmlElement("w:p")
     title_ppr = OxmlElement("w:pPr")
     jc = OxmlElement("w:jc"); jc.set(qn("w:val"), "center")
@@ -411,14 +478,10 @@ def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
     title_r.append(title_t); title_p.append(title_r)
     toc_elements.append(title_p)
 
-    # Lignes de TOC
     level_cfg = {
-        1: {"indent": "0",   "font_size": "22", "bold": True,  "color": HEX_H1,
-            "before": "120", "after": "60"},
-        2: {"indent": "360", "font_size": "20", "bold": False, "color": HEX_H2,
-            "before": "60",  "after": "40"},
-        3: {"indent": "720", "font_size": "18", "bold": False, "color": HEX_H3,
-            "before": "40",  "after": "20"},
+        1: {"indent": "0",   "font_size": "22", "bold": True,  "color": HEX_H1, "before": "120", "after": "60"},
+        2: {"indent": "360", "font_size": "20", "bold": False, "color": HEX_H2, "before": "60",  "after": "40"},
+        3: {"indent": "720", "font_size": "18", "bold": False, "color": HEX_H3, "before": "40",  "after": "20"},
     }
 
     for entry in toc_entries:
@@ -428,15 +491,11 @@ def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
 
         toc_p   = OxmlElement("w:p")
         toc_ppr = OxmlElement("w:pPr")
-
         ind = OxmlElement("w:ind"); ind.set(qn("w:left"), cfg["indent"])
         toc_ppr.append(ind)
-
         sp2 = OxmlElement("w:spacing")
         sp2.set(qn("w:before"), cfg["before"]); sp2.set(qn("w:after"), cfg["after"])
         toc_ppr.append(sp2)
-
-        # Tab stop avec points de suite
         tabs = OxmlElement("w:tabs")
         tab  = OxmlElement("w:tab")
         tab.set(qn("w:val"), "right"); tab.set(qn("w:leader"), "dot")
@@ -444,7 +503,6 @@ def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
         tabs.append(tab); toc_ppr.append(tabs)
         toc_p.append(toc_ppr)
 
-        # Texte titre
         r_text  = OxmlElement("w:r")
         r_rpr   = OxmlElement("w:rPr")
         r_sz    = OxmlElement("w:sz");    r_sz.set(qn("w:val"), cfg["font_size"])
@@ -458,7 +516,6 @@ def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
         r_t.set(qn("xml:space"), "preserve"); r_t.text = text
         r_text.append(r_t); toc_p.append(r_text)
 
-        # Tab + tiret (numéro de page non disponible en headless)
         r_pg     = OxmlElement("w:r")
         r_pg_rpr = OxmlElement("w:rPr")
         r_pg_sz  = OxmlElement("w:sz");    r_pg_sz.set(qn("w:val"), cfg["font_size"])
@@ -468,10 +525,8 @@ def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
         r_pg.append(OxmlElement("w:tab"))
         pg_t = OxmlElement("w:t"); pg_t.text = "—"
         r_pg.append(pg_t); toc_p.append(r_pg)
-
         toc_elements.append(toc_p)
 
-    # Saut de page
     pb_p = OxmlElement("w:p")
     pb_r = OxmlElement("w:r")
     pb_e = OxmlElement("w:br"); pb_e.set(qn("w:type"), "page")
@@ -488,48 +543,34 @@ def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
         for el in toc_elements:
             doc.element.body.append(el)
 
-    logger.info(f"TOC manuelle inseree — {len(toc_entries)} entrees")
+    logger.info(f"TOC inseree — {len(toc_entries)} entrees")
     return True
 
 
 # ── Tableaux ──────────────────────────────────────────────────────────────────
 def _format_tables(doc: Document) -> int:
-    """
-    Pour chaque tableau du document :
-    - Bordures fines sur toutes les cellules
-    - Première ligne (en-tête) : fond bleu marine, texte blanc, gras
-    - Lignes alternées : fond bleu très clair
-    - Police harmonisée
-    """
     count = 0
     for table in doc.tables:
         try:
             _style_table(table)
             count += 1
         except Exception as e:
-            logger.warning(f"Tableau ignoré: {e}")
+            logger.warning(f"Tableau ignore: {e}")
     return count
 
 
 def _style_table(table):
-    """Applique le style pro sur un tableau."""
     for row_idx, row in enumerate(table.rows):
         is_header = (row_idx == 0)
         is_alt    = (row_idx % 2 == 0) and not is_header
-
         for cell in row.cells:
-            # ── Fond de cellule ──────────────────────────────────
             if is_header:
                 _set_cell_background(cell, HEX_TBL_HEAD)
             elif is_alt:
                 _set_cell_background(cell, HEX_TBL_ALT)
             else:
                 _set_cell_background(cell, "FFFFFF")
-
-            # ── Bordures de cellule ──────────────────────────────
             _set_cell_borders(cell)
-
-            # ── Texte de la cellule ──────────────────────────────
             for para in cell.paragraphs:
                 para.paragraph_format.space_before = Pt(2)
                 para.paragraph_format.space_after  = Pt(2)
@@ -545,35 +586,27 @@ def _style_table(table):
 
 
 def _set_cell_background(cell, hex_color: str):
-    """Définit la couleur de fond d'une cellule."""
     tc   = cell._tc
     tcPr = tc.get_or_add_tcPr()
     shd  = tcPr.find(qn("w:shd"))
     if shd is None:
-        shd = OxmlElement("w:shd")
-        tcPr.append(shd)
-    shd.set(qn("w:val"),   "clear")
-    shd.set(qn("w:color"), "auto")
-    shd.set(qn("w:fill"),  hex_color)
+        shd = OxmlElement("w:shd"); tcPr.append(shd)
+    shd.set(qn("w:val"), "clear"); shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), hex_color)
 
 
 def _set_cell_borders(cell):
-    """Bordures fines grises sur toutes les cellules."""
     tc   = cell._tc
     tcPr = tc.get_or_add_tcPr()
     tcBorders = tcPr.find(qn("w:tcBorders"))
     if tcBorders is None:
-        tcBorders = OxmlElement("w:tcBorders")
-        tcPr.append(tcBorders)
+        tcBorders = OxmlElement("w:tcBorders"); tcPr.append(tcBorders)
     for side in ["top", "left", "bottom", "right", "insideH", "insideV"]:
         el = tcBorders.find(qn(f"w:{side}"))
         if el is None:
-            el = OxmlElement(f"w:{side}")
-            tcBorders.append(el)
-        el.set(qn("w:val"),   "single")
-        el.set(qn("w:sz"),    "4")
-        el.set(qn("w:space"), "0")
-        el.set(qn("w:color"), "BFBFBF")
+            el = OxmlElement(f"w:{side}"); tcBorders.append(el)
+        el.set(qn("w:val"), "single"); el.set(qn("w:sz"), "4")
+        el.set(qn("w:space"), "0");    el.set(qn("w:color"), "BFBFBF")
 
 
 # ── Images ────────────────────────────────────────────────────────────────────
@@ -602,16 +635,33 @@ def _fix_images(doc) -> int:
 
 
 # ── Pagination ────────────────────────────────────────────────────────────────
-def _add_pagination(doc):
+def _add_pagination(doc: Document, start_page: int = 1):
+    """
+    Pied de page avec numéro de page.
+    start_page : numéro affiché sur la première page du document.
+    """
     if not doc.sections:
         return
+
     for sec in doc.sections:
         sec.top_margin    = Cm(2.5)
         sec.bottom_margin = Cm(2.5)
         sec.left_margin   = Cm(2.5)
         sec.right_margin  = Cm(2.5)
 
-    footer = doc.sections[-1].footer
+    section = doc.sections[-1]
+
+    # ── Numéro de page de départ ──────────────────────────────────
+    if start_page != 1:
+        sectPr = section._sectPr
+        pgNumType = sectPr.find(qn("w:pgNumType"))
+        if pgNumType is None:
+            pgNumType = OxmlElement("w:pgNumType")
+            sectPr.append(pgNumType)
+        pgNumType.set(qn("w:start"), str(start_page))
+
+    # ── Pied de page ──────────────────────────────────────────────
+    footer = section.footer
     fp = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
     fp.clear()
     fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
