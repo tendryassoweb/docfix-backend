@@ -1,5 +1,5 @@
 """
-config.py — Configuration centralisée
+config.py v2.0 — avec N8N_GEMINI_WEBHOOK_URL
 Impulse AI — DocFix
 """
 
@@ -9,9 +9,8 @@ from typing import List
 
 
 class Settings:
-    # ── API ──────────────────────────────────────────────────────
     APP_NAME: str = "DocFix API — Impulse AI"
-    VERSION: str  = "1.1.0"
+    VERSION: str  = "2.0.0"
     DEBUG: bool   = os.getenv("DEBUG", "false").lower() == "true"
     PORT: int     = int(os.getenv("PORT", "8000"))
 
@@ -20,21 +19,17 @@ class Settings:
         "ALLOWED_ORIGINS",
         "http://localhost:3000,https://localhost:3000"
     )
-    ALLOWED_ORIGINS: List[str] = [o.strip() for o in _origins_raw.split(",") if o.strip()]
+    ALLOWED_ORIGINS: List[str] = [
+        o.strip() for o in _origins_raw.split(",") if o.strip()
+    ]
 
-    # ── IA Principale : Gemini ────────────────────────────────────
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    # ── IA via n8n webhook ────────────────────────────────────────
+    # URL du webhook n8n qui appelle Gemini
+    # Ex: https://ton-n8n.onrender.com/webhook/gemini-analyze
+    N8N_GEMINI_WEBHOOK_URL: str = os.getenv("N8N_GEMINI_WEBHOOK_URL", "")
 
-    # ── IA Fallback (brancher ce que tu veux) ────────────────────
-    # Laisser vide pour désactiver le fallback
-    # Compatible : OpenAI, Mistral, Groq, Cohere, Together AI...
-    # ou n'importe quelle API qui accepte le format OpenAI
-    FALLBACK_AI_ENABLED: bool   = os.getenv("FALLBACK_AI_ENABLED", "false").lower() == "true"
-    FALLBACK_AI_API_KEY: str    = os.getenv("FALLBACK_AI_API_KEY", "")
-    FALLBACK_AI_BASE_URL: str   = os.getenv("FALLBACK_AI_BASE_URL", "")
-    FALLBACK_AI_MODEL: str      = os.getenv("FALLBACK_AI_MODEL", "")
-    FALLBACK_AI_NAME: str       = os.getenv("FALLBACK_AI_NAME", "Fallback AI")
+    # Secret optionnel pour sécuriser le webhook
+    N8N_WEBHOOK_SECRET: str = os.getenv("N8N_WEBHOOK_SECRET", "")
 
     # ── Fichiers ─────────────────────────────────────────────────
     MAX_FILE_SIZE_MB: int    = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
@@ -45,31 +40,18 @@ class Settings:
     # ── LibreOffice ───────────────────────────────────────────────
     LIBREOFFICE_PATH: str = os.getenv("LIBREOFFICE_PATH", "soffice")
 
-    # ── n8n (optionnel) ───────────────────────────────────────────
-    N8N_WEBHOOK_SECRET: str = os.getenv("N8N_WEBHOOK_SECRET", "")
+    # ── Fallback (désactivé — géré par n8n maintenant) ───────────
+    FALLBACK_AI_ENABLED: bool = False
 
     def validate(self):
         import logging
         log = logging.getLogger("docfix.config")
-        warnings = []
-
-        if not self.GEMINI_API_KEY:
-            warnings.append("GEMINI_API_KEY manquante — analyse IA désactivée")
-
-        if self.FALLBACK_AI_ENABLED:
-            if not self.FALLBACK_AI_API_KEY:
-                warnings.append("FALLBACK_AI_API_KEY manquante — fallback désactivé")
-            if not self.FALLBACK_AI_BASE_URL:
-                warnings.append("FALLBACK_AI_BASE_URL manquante — fallback désactivé")
-            if not self.FALLBACK_AI_MODEL:
-                warnings.append("FALLBACK_AI_MODEL manquant — fallback désactivé")
-            else:
-                log.info(f"Fallback IA activé : {self.FALLBACK_AI_NAME} ({self.FALLBACK_AI_MODEL})")
-
-        for w in warnings:
-            log.warning(f"⚠️  {w}")
-
         self.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+        if self.N8N_GEMINI_WEBHOOK_URL:
+            log.info(f"✅ n8n webhook configuré : {self.N8N_GEMINI_WEBHOOK_URL}")
+        else:
+            log.warning("⚠️  N8N_GEMINI_WEBHOOK_URL non configurée — heuristique locale uniquement")
 
 
 settings = Settings()

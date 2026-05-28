@@ -1,9 +1,9 @@
 """
-ai_service.py — Couche IA avec fallback générique et détecteur d'erreurs
+ai_service.py v2.0 — via n8n webhook
 Impulse AI — DocFix
 
 Chaîne :
-  Gemini Flash  →  (quota/erreur)  →  Fallback API  →  (erreur)  →  Heuristique locale
+  n8n webhook (Gemini Flash)  →  échec  →  heuristique locale
 """
 
 import json
@@ -15,8 +15,8 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import Optional
 
-import google.generativeai as genai
 from docx import Document
+from docx.shared import Pt
 
 from .config import settings
 
@@ -24,38 +24,36 @@ logger = logging.getLogger("docfix.ai")
 
 
 # ── Types ─────────────────────────────────────────────────────────────────────
-
 class AIProvider(str, Enum):
-    GEMINI    = "gemini"
-    FALLBACK  = "fallback"
-    HEURISTIC = "heuristic"  # pas d'IA, règles locales uniquement
+    N8N       = "n8n_gemini"
+    HEURISTIC = "heuristic"
 
 
 class AIErrorType(str, Enum):
-    QUOTA_EXCEEDED  = "quota_exceeded"
-    INVALID_KEY     = "invalid_key"
-    UNAVAILABLE     = "unavailable"
-    TIMEOUT         = "timeout"
-    PARSE_ERROR     = "parse_error"
-    NONE            = "none"
+    QUOTA_EXCEEDED = "quota_exceeded"
+    INVALID_KEY    = "invalid_key"
+    UNAVAILABLE    = "unavailable"
+    TIMEOUT        = "timeout"
+    NONE           = "none"
 
 
 @dataclass
 class AIResult:
-    """Résultat de l'analyse IA avec métadonnées de diagnostic."""
-    data: dict                          # résultat JSON de l'analyse
-    provider: AIProvider                # qui a répondu
-    error_type: AIErrorType             # erreur rencontrée (si fallback activé)
-    error_detail: Optional[str] = None  # message d'erreur brut
-    tokens_used: Optional[int]  = None  # tokens consommés si disponible
+    data:         dict
+    provider:     AIProvider
+    error_type:   AIErrorType
+    error_detail: Optional[str] = None
 
 
-# ── Configuration Gemini ──────────────────────────────────────────────────────
-if settings.GEMINI_API_KEY:
-    genai.configure(api_key=settings.GEMINI_API_KEY)
+# ── Extraction des paragraphes ────────────────────────────────────────────────
+def _extract_paragraphs(doc: Document) -> list:
+    return [
+        {"idx": i, "text": p.text.strip()}
+        for i, p in enumerate(doc.paragraphs)
+        if p.text.strip()
+    ][:50]
 
 
-# ── Prompt partagé ────────────────────────────────────────────────────────────
 def _build_prompt(paragraphs: list) -> str:
     return f"""Analyse ce document Word et identifie les titres et sous-titres.
 
@@ -75,259 +73,142 @@ Réponds UNIQUEMENT en JSON valide avec cette structure exacte :
 Critères d'un titre : texte court (<80 car), pas de point final, logique de section."""
 
 
-def _parse_ai_response(raw: str) -> dict:
-    """Nettoie et parse la réponse JSON de n'importe quelle IA."""
-    # Supprimer les balises markdown
+def _parse_response(raw: str) -> dict:
     clean = re.sub(r"```json|```", "", raw).strip()
-    # Extraire le premier objet JSON valide
     match = re.search(r"\{.*\}", clean, re.DOTALL)
     if match:
         return json.loads(match.group())
     return json.loads(clean)
 
 
-def _extract_paragraphs(doc: Document) -> list:
-    """Extrait les 50 premiers paragraphes non vides pour l'analyse."""
-    return [
-        {"idx": i, "text": p.text.strip()}
-        for i, p in enumerate(doc.paragraphs)
-        if p.text.strip()
-    ][:50]
-
-
-def _detect_error_type(error_msg: str) -> AIErrorType:
-    """Classifie le type d'erreur à partir du message."""
-    msg = error_msg.lower()
-    if "429" in msg or "quota" in msg or "rate limit" in msg or "resource_exhausted" in msg:
+def _detect_error_type(msg: str) -> AIErrorType:
+    m = msg.lower()
+    if "429" in m or "quota" in m or "rate" in m:
         return AIErrorType.QUOTA_EXCEEDED
-    if "401" in msg or "403" in msg or "api key" in msg or "invalid" in msg and "key" in msg:
+    if "401" in m or "403" in m or "key" in m:
         return AIErrorType.INVALID_KEY
-    if "timeout" in msg or "timed out" in msg:
+    if "timeout" in m:
         return AIErrorType.TIMEOUT
-    if "503" in msg or "unavailable" in msg or "overloaded" in msg:
-        return AIErrorType.UNAVAILABLE
     return AIErrorType.UNAVAILABLE
 
 
-# ── Provider 1 : Gemini ───────────────────────────────────────────────────────
-async def _call_gemini(prompt: str) -> dict:
-    """Appel à Gemini Flash. Lève une exception typée si erreur."""
-    model = genai.GenerativeModel(settings.GEMINI_MODEL)
-    response = await asyncio.to_thread(
-        model.generate_content,
-        prompt,
-        generation_config={"temperature": 0.1, "max_output_tokens": 1024},
-    )
-    return _parse_ai_response(response.text)
+# ── Heuristique locale ────────────────────────────────────────────────────────
+def _heuristic_analysis(paragraphs: list) -> dict:
+    titles = []
+    for p in paragraphs:
+        text = p["text"]
+        if not text or len(text) > 100:
+            continue
+        no_dot  = not text.endswith(".")
+        short   = len(text) < 80
+        num     = bool(re.match(r"^\d+[\.\)]\s+\w", text))
+        caps    = text == text.upper() and len(text) > 3
+        roman   = bool(re.match(r"^[IVX]+[\.\)]\s+\w", text))
+        if short and no_dot and (num or caps or roman):
+            level = 1 if caps else 2
+            titles.append({"idx": p["idx"], "level": level, "reason": "heuristique"})
+    return {"doc_type": "unknown", "likely_titles": titles, "language": "fr"}
 
 
-# ── Provider 2 : Fallback générique (format OpenAI compatible) ────────────────
-async def _call_fallback(prompt: str) -> dict:
+# ── Appel n8n webhook ─────────────────────────────────────────────────────────
+async def _call_n8n(prompt: str) -> dict:
     """
-    Appel à l'API fallback configurée.
-    Compatible avec toute API au format OpenAI (Mistral, Groq, Together, etc.)
+    Envoie le prompt au webhook n8n qui appelle Gemini.
+    n8n retourne directement le JSON parsé.
     """
-    headers = {
-        "Authorization": f"Bearer {settings.FALLBACK_AI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": settings.FALLBACK_AI_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": "Tu es un assistant qui analyse des documents Word. Réponds toujours en JSON valide uniquement, sans markdown."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "temperature": 0.1,
-        "max_tokens": 1024,
-    }
+    if not settings.N8N_GEMINI_WEBHOOK_URL:
+        raise ValueError("N8N_GEMINI_WEBHOOK_URL non configurée")
+
+    headers = {"Content-Type": "application/json"}
+
+    # Ajouter le secret si configuré
+    if settings.N8N_WEBHOOK_SECRET:
+        headers["X-Webhook-Secret"] = settings.N8N_WEBHOOK_SECRET
+
+    payload = {"prompt": prompt}
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
-            f"{settings.FALLBACK_AI_BASE_URL}/chat/completions",
+            settings.N8N_GEMINI_WEBHOOK_URL,
             headers=headers,
             json=payload,
         )
         response.raise_for_status()
         data = response.json()
-        raw = data["choices"][0]["message"]["content"]
-        return _parse_ai_response(raw)
 
+        # n8n peut retourner une liste ou un objet
+        if isinstance(data, list):
+            data = data[0]
 
-# ── Provider 3 : Heuristique locale (aucune IA) ───────────────────────────────
-def _heuristic_analysis(paragraphs: list) -> dict:
-    """
-    Détection de titres par règles locales.
-    Utilisé quand toutes les IA sont indisponibles.
-    """
-    likely_titles = []
-    for p in paragraphs:
-        text = p["text"]
-        if not text or len(text) > 100:
-            continue
-        no_period   = not text.endswith(".")
-        is_short    = len(text) < 80
-        is_numbered = bool(re.match(r"^\d+[\.\)]\s+\w", text))
-        is_caps     = text == text.upper() and len(text) > 3
-        is_roman    = bool(re.match(r"^[IVX]+[\.\)]\s+\w", text))
-
-        if is_short and no_period and (is_numbered or is_caps or is_roman):
-            level = 1 if is_caps else 2
-            likely_titles.append({
-                "idx": p["idx"],
-                "level": level,
-                "reason": "heuristique locale"
-            })
-
-    return {
-        "doc_type": "unknown",
-        "likely_titles": likely_titles,
-        "language": "fr",
-    }
+        return data
 
 
 # ── Point d'entrée principal ──────────────────────────────────────────────────
 async def analyze_document(doc: Document, job_id: str = "") -> AIResult:
     """
-    Analyse le document avec la chaîne de fallback :
-    Gemini → Fallback API → Heuristique locale
-
-    Retourne toujours un AIResult valide, jamais d'exception.
+    Analyse le document :
+    1. Essaie le webhook n8n (Gemini)
+    2. Fallback sur l'heuristique locale
     """
     paragraphs = _extract_paragraphs(doc)
     prompt     = _build_prompt(paragraphs)
     prefix     = f"[{job_id}] " if job_id else ""
 
-    # ── Tentative 1 : Gemini ──────────────────────────────────────
-    if settings.GEMINI_API_KEY:
+    # ── Tentative n8n ─────────────────────────────────────────────
+    if settings.N8N_GEMINI_WEBHOOK_URL:
         try:
-            data = await _call_gemini(prompt)
-            titles_count = len(data.get("likely_titles", []))
-            logger.info(f"{prefix}✅ Gemini OK — {titles_count} titres détectés")
+            data = await _call_n8n(prompt)
+            count = len(data.get("likely_titles", []))
+            logger.info(f"{prefix}✅ n8n/Gemini OK — {count} titres")
             return AIResult(
                 data=data,
-                provider=AIProvider.GEMINI,
+                provider=AIProvider.N8N,
                 error_type=AIErrorType.NONE,
             )
         except Exception as e:
             error_type   = _detect_error_type(str(e))
             error_detail = str(e)
-
-            # Log selon le type d'erreur
             if error_type == AIErrorType.QUOTA_EXCEEDED:
-                logger.warning(f"{prefix}⚠️  Gemini quota dépassé — activation du fallback")
-            elif error_type == AIErrorType.INVALID_KEY:
-                logger.error(f"{prefix}❌ Gemini clé API invalide — vérifier GEMINI_API_KEY")
+                logger.warning(f"{prefix}⚠️ n8n/Gemini quota dépassé — fallback heuristique")
             else:
-                logger.warning(f"{prefix}⚠️  Gemini indisponible ({error_type}) — activation du fallback")
+                logger.warning(f"{prefix}⚠️ n8n/Gemini indisponible ({error_type}): {e} — fallback")
     else:
-        error_type   = AIErrorType.INVALID_KEY
-        error_detail = "GEMINI_API_KEY non configurée"
-        logger.warning(f"{prefix}⚠️  Gemini non configuré")
+        logger.info(f"{prefix}ℹ️ N8N_GEMINI_WEBHOOK_URL non configurée — heuristique locale")
+        error_type   = AIErrorType.UNAVAILABLE
+        error_detail = "N8N_GEMINI_WEBHOOK_URL non configurée"
 
-    # ── Tentative 2 : Fallback API ────────────────────────────────
-    fallback_ready = (
-        settings.FALLBACK_AI_ENABLED
-        and settings.FALLBACK_AI_API_KEY
-        and settings.FALLBACK_AI_BASE_URL
-        and settings.FALLBACK_AI_MODEL
-    )
-
-    if fallback_ready:
-        try:
-            data = await _call_fallback(prompt)
-            titles_count = len(data.get("likely_titles", []))
-            logger.info(f"{prefix}✅ {settings.FALLBACK_AI_NAME} OK — {titles_count} titres détectés")
-            return AIResult(
-                data=data,
-                provider=AIProvider.FALLBACK,
-                error_type=error_type,        # on garde l'erreur Gemini pour info
-                error_detail=error_detail,
-            )
-        except Exception as e2:
-            fallback_error = _detect_error_type(str(e2))
-            logger.warning(
-                f"{prefix}⚠️  {settings.FALLBACK_AI_NAME} indisponible ({fallback_error}) "
-                f"— activation de l'heuristique locale"
-            )
-    else:
-        if settings.FALLBACK_AI_ENABLED:
-            logger.warning(f"{prefix}⚠️  Fallback activé mais mal configuré — vérifier les variables")
-        else:
-            logger.info(f"{prefix}ℹ️  Fallback désactivé — heuristique locale utilisée")
-
-    # ── Tentative 3 : Heuristique locale ─────────────────────────
-    data = _heuristic_analysis(paragraphs)
-    titles_count = len(data.get("likely_titles", []))
-    logger.info(f"{prefix}🔧 Heuristique locale — {titles_count} titres détectés")
+    # ── Fallback heuristique ──────────────────────────────────────
+    data  = _heuristic_analysis(paragraphs)
+    count = len(data.get("likely_titles", []))
+    logger.info(f"{prefix}🔧 Heuristique locale — {count} titres")
     return AIResult(
         data=data,
         provider=AIProvider.HEURISTIC,
         error_type=error_type,
-        error_detail=error_detail,
+        error_detail=error_detail if 'error_detail' in dir() else None,
     )
 
 
-# ── Test de connectivité ───────────────────────────────────────────────────────
+# ── Status checks ─────────────────────────────────────────────────────────────
 async def check_gemini_status() -> dict:
-    """Vérifie si Gemini est accessible et le quota disponible."""
-    if not settings.GEMINI_API_KEY:
-        return {"status": "not_configured", "provider": "gemini"}
+    """Vérifie le webhook n8n/Gemini avec un prompt minimal."""
+    if not settings.N8N_GEMINI_WEBHOOK_URL:
+        return {"status": "not_configured", "provider": "n8n_gemini"}
     try:
-        model = genai.GenerativeModel(settings.GEMINI_MODEL)
-        await asyncio.to_thread(
-            model.generate_content,
-            "Réponds juste: OK",
-            generation_config={"max_output_tokens": 5},
-        )
-        return {"status": "ok", "provider": "gemini", "model": settings.GEMINI_MODEL}
-    except Exception as e:
-        error_type = _detect_error_type(str(e))
+        test_prompt = '[{"idx": 0, "text": "Test"}]\nRéponds: {"doc_type":"test","likely_titles":[],"language":"fr"}'
+        data = await _call_n8n(test_prompt)
         return {
-            "status": error_type.value,
-            "provider": "gemini",
-            "model": settings.GEMINI_MODEL,
-            "detail": str(e)[:200],
+            "status":   "ok",
+            "provider": "n8n_gemini",
+            "webhook":  settings.N8N_GEMINI_WEBHOOK_URL,
+        }
+    except Exception as e:
+        return {
+            "status":   _detect_error_type(str(e)).value,
+            "provider": "n8n_gemini",
+            "detail":   str(e)[:200],
         }
 
 
 async def check_fallback_status() -> dict:
-    """Vérifie si le fallback est accessible."""
-    if not settings.FALLBACK_AI_ENABLED:
-        return {"status": "disabled", "provider": settings.FALLBACK_AI_NAME}
-    if not all([settings.FALLBACK_AI_API_KEY, settings.FALLBACK_AI_BASE_URL, settings.FALLBACK_AI_MODEL]):
-        return {"status": "misconfigured", "provider": settings.FALLBACK_AI_NAME}
-    try:
-        headers = {
-            "Authorization": f"Bearer {settings.FALLBACK_AI_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": settings.FALLBACK_AI_MODEL,
-            "messages": [{"role": "user", "content": "Réponds juste: OK"}],
-            "max_tokens": 5,
-        }
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                f"{settings.FALLBACK_AI_BASE_URL}/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            response.raise_for_status()
-        return {
-            "status": "ok",
-            "provider": settings.FALLBACK_AI_NAME,
-            "model": settings.FALLBACK_AI_MODEL,
-        }
-    except Exception as e:
-        error_type = _detect_error_type(str(e))
-        return {
-            "status": error_type.value,
-            "provider": settings.FALLBACK_AI_NAME,
-            "detail": str(e)[:200],
-        }
+    return {"status": "disabled", "provider": "none"}
