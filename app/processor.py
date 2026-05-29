@@ -1,11 +1,10 @@
 """
-processor.py v1.9
+processor.py v2.0
 Impulse AI — DocFix
 
 Nouveautés :
-- Suppression des pages blanches superflues
-- Numéro de page configurable (start_page)
-- Table des matières optionnelle (include_toc)
+- TOC avec numéros de page estimés
+- start_page pris en compte dans l'estimation
 """
 
 import asyncio, logging, subprocess, time, re, os
@@ -41,22 +40,16 @@ HEX_TBL_ALT  = "EEF3FA"
 FONT_HEAD = "Calibri"
 FONT_BODY = "Calibri"
 
+# Caractères moyens par page A4 (Calibri 11pt, marges 2.5cm)
+CHARS_PER_PAGE = 2800
+
 
 async def process_document(
-    job_id: str,
-    input_path: Path,
-    start_page: int = 1,
+    job_id:      str,
+    input_path:  Path,
+    start_page:  int  = 1,
     include_toc: bool = True,
 ):
-    """
-    Traitement principal.
-    
-    Args:
-        job_id      : identifiant du job
-        input_path  : chemin du fichier DOCX source
-        start_page  : numéro de la première page (défaut: 1)
-        include_toc : inclure la table des matières (défaut: True)
-    """
     job = job_store.get(job_id)
     if not job:
         return
@@ -74,7 +67,7 @@ async def process_document(
         await asyncio.sleep(0)
         _step_done(job, "parse", 8)
 
-        _step_start(job, "ai", "Analyse IA...")
+        _step_start(job, "ai", "Analyse IA via n8n...")
         ai_result = await analyze_document(doc, job_id)
         _step_done(job, "ai", 18)
 
@@ -93,10 +86,9 @@ async def process_document(
         logger.info(f"[{job_id}] {n_heads} titres detectes")
         _step_done(job, "headings", 44)
 
-        # Styles + couleurs + TOC dans un seul thread
-        _step_start(job, "styles", "Application styles et couleurs...")
+        _step_start(job, "styles", "Application styles, couleurs et TOC...")
         toc_ok = await asyncio.to_thread(
-            _apply_all_formatting, doc, heading_map, include_toc
+            _apply_all_formatting, doc, heading_map, include_toc, start_page
         )
         _step_done(job, "styles", 54)
 
@@ -111,7 +103,6 @@ async def process_document(
         _step_start(job, "pagination", "Tableaux et pagination...")
         n_tables = await asyncio.to_thread(_format_tables, doc)
         await asyncio.to_thread(_add_pagination, doc, start_page)
-        logger.info(f"[{job_id}] {n_tables} tableaux formates, pagination depuis page {start_page}")
         _step_done(job, "pagination", 79)
 
         _step_start(job, "export_docx", "Sauvegarde DOCX...")
@@ -137,7 +128,7 @@ async def process_document(
         job.status       = "done"
         job.progress     = 100
         job.current_step = "Traitement termine"
-        logger.info(f"Job {job_id} OK en {duration}s")
+        logger.info(f"Job {job_id} OK en {duration}s — heads={n_heads} toc={toc_ok}")
 
     except Exception as exc:
         logger.error(f"Erreur job {job_id}: {exc}", exc_info=True)
@@ -151,11 +142,11 @@ async def process_document(
         input_path.unlink(missing_ok=True)
 
 
-def _apply_all_formatting(doc: Document, heading_map: dict, include_toc: bool) -> bool:
+def _apply_all_formatting(doc, heading_map, include_toc, start_page):
     _setup_styles(doc)
     _apply_heading_styles_with_map(doc, heading_map)
     if include_toc:
-        return _add_toc_manual(doc, heading_map)
+        return _add_toc_manual(doc, heading_map, start_page)
     return False
 
 
@@ -171,7 +162,7 @@ def _step_done(job, sid, pct):
         job.progress = pct
 
 
-# ── Nettoyage espaces ─────────────────────────────────────────────────────────
+# ── Nettoyage ─────────────────────────────────────────────────────────────────
 def _clean_whitespace(doc):
     prev_empty = False
     to_del = []
@@ -189,42 +180,21 @@ def _clean_whitespace(doc):
         p._element.getparent().remove(p._element)
 
 
-# ── Suppression pages blanches ────────────────────────────────────────────────
-def _remove_blank_pages(doc: Document):
-    """
-    Supprime les sauts de page consécutifs qui créent des pages blanches.
-    Stratégie : détecter les paragraphes qui ne contiennent QUE
-    un saut de page (w:br type=page) et les supprimer si le paragraphe
-    précédent ou suivant contient aussi un saut de page.
-    """
-    # Collecter tous les paragraphes avec saut de page uniquement
+def _remove_blank_pages(doc):
     page_break_paras = []
     for para in doc.paragraphs:
-        text = para.text.strip()
-        if text:
-            continue  # contient du texte réel → garder
-        # Chercher un w:br type=page
-        has_page_break = False
-        for run in para.runs:
-            for br in run._element.findall(qn("w:br")):
-                if br.get(qn("w:type")) == "page":
-                    has_page_break = True
-                    break
-        # Chercher aussi dans les éléments directs du paragraphe
+        if para.text.strip():
+            continue
         for br in para._element.iter(qn("w:br")):
             if br.get(qn("w:type")) == "page":
-                has_page_break = True
+                page_break_paras.append(para)
                 break
-        if has_page_break:
-            page_break_paras.append(para)
 
-    # Supprimer les sauts de page consécutifs (garder le premier)
-    to_del = []
     paras_list = list(doc.paragraphs)
+    to_del = []
     for i, para in enumerate(paras_list):
         if para not in page_break_paras:
             continue
-        # Si le paragraphe précédent est aussi un saut de page → supprimer celui-ci
         if i > 0 and paras_list[i-1] in page_break_paras:
             to_del.append(para)
 
@@ -232,23 +202,17 @@ def _remove_blank_pages(doc: Document):
         para._element.getparent().remove(para._element)
 
     if to_del:
-        logger.info(f"Pages blanches supprimees : {len(to_del)}")
+        logger.info(f"Pages blanches supprimees: {len(to_del)}")
 
-    # Supprimer aussi les paragraphes vides en fin de document
-    _remove_trailing_empty_paras(doc)
-
-
-def _remove_trailing_empty_paras(doc: Document):
-    """Supprime les paragraphes vides en fin de document."""
+    # Supprimer paragraphes vides en fin de document
     paras = list(doc.paragraphs)
-    to_del = []
+    to_del2 = []
     for para in reversed(paras):
         if not para.text.strip():
-            to_del.append(para)
+            to_del2.append(para)
         else:
-            break  # dès qu'on trouve du contenu on s'arrête
-    # Garder au moins un paragraphe final
-    for para in to_del[:-1] if len(to_del) > 1 else []:
+            break
+    for para in (to_del2[:-1] if len(to_del2) > 1 else []):
         para._element.getparent().remove(para._element)
 
 
@@ -268,7 +232,7 @@ def _harmonize_fonts(doc):
 
 
 # ── Détection titres ──────────────────────────────────────────────────────────
-def _detect_headings(doc: Document, ai_hints: dict) -> dict:
+def _detect_headings(doc, ai_hints) -> dict:
     ai_map = {t["idx"]: t.get("level", 1) for t in ai_hints.get("likely_titles", [])}
     result = {}
     for i, para in enumerate(doc.paragraphs):
@@ -277,10 +241,8 @@ def _detect_headings(doc: Document, ai_hints: dict) -> dict:
             continue
         sn = para.style.name if para.style else ""
         if sn.startswith("Heading"):
-            try:
-                lvl = int(sn.split()[-1])
-            except (ValueError, IndexError):
-                lvl = 1
+            try:    lvl = int(sn.split()[-1])
+            except: lvl = 1
             result[i] = lvl
             continue
         level = ai_map.get(i)
@@ -317,17 +279,14 @@ def _setup_styles(doc):
     }
     for name, c in cfgs.items():
         try:
-            try:
-                st = doc.styles[name]
-            except KeyError:
-                st = doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+            try:    st = doc.styles[name]
+            except: st = doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
             st.font.name      = FONT_HEAD
             st.font.size      = c["size"]
             st.font.color.rgb = c["color"]
             st.font.bold      = c["bold"]
             st.font.italic    = c["italic"]
-            if c["caps"]:
-                st.font.all_caps = True
+            if c["caps"]: st.font.all_caps = True
             pf = st.paragraph_format
             pf.space_before      = c["before"]
             pf.space_after       = c["after"]
@@ -344,38 +303,26 @@ def _setup_styles(doc):
         n.paragraph_format.space_after       = Pt(6)
         n.paragraph_format.alignment         = WD_ALIGN_PARAGRAPH.JUSTIFY
         n.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
-    except Exception:
-        pass
+    except: pass
 
 
 # ── Appliquer styles ──────────────────────────────────────────────────────────
-def _apply_heading_styles_with_map(doc: Document, heading_map: dict):
+def _apply_heading_styles_with_map(doc, heading_map):
     hex_map   = {1: HEX_H1,  2: HEX_H2,  3: HEX_H3}
     size_map  = {1: Pt(18),  2: Pt(14),  3: Pt(12)}
-    align_map = {
-        1: WD_ALIGN_PARAGRAPH.CENTER,
-        2: WD_ALIGN_PARAGRAPH.LEFT,
-        3: WD_ALIGN_PARAGRAPH.LEFT,
-    }
+    align_map = {1: WD_ALIGN_PARAGRAPH.CENTER,
+                 2: WD_ALIGN_PARAGRAPH.LEFT,
+                 3: WD_ALIGN_PARAGRAPH.LEFT}
     for i, para in enumerate(doc.paragraphs):
         lvl = heading_map.get(i)
-        if not lvl:
-            continue
+        if not lvl: continue
         lvl = min(lvl, 3)
-        try:
-            para.style = doc.styles[f"Heading {lvl}"]
-        except KeyError:
-            pass
+        try: para.style = doc.styles[f"Heading {lvl}"]
+        except: pass
         para.paragraph_format.alignment = align_map[lvl]
         for run in para.runs:
-            _force_run_formatting(
-                run,
-                hex_color = hex_map[lvl],
-                size      = size_map[lvl],
-                bold      = True,
-                italic    = (lvl == 3),
-                all_caps  = (lvl == 1),
-            )
+            _force_run_formatting(run, hex_map[lvl], size_map[lvl],
+                                  bold=True, italic=(lvl==3), all_caps=(lvl==1))
         pf = para.paragraph_format
         pf.space_before   = {1: Pt(24), 2: Pt(16), 3: Pt(12)}[lvl]
         pf.space_after    = {1: Pt(8),  2: Pt(6),  3: Pt(4)}[lvl]
@@ -384,67 +331,71 @@ def _apply_heading_styles_with_map(doc: Document, heading_map: dict):
             _set_para_border(para, "bottom", HEX_H1, "8")
 
 
-# ── Helpers XML ───────────────────────────────────────────────────────────────
-def _set_run_color(run, hex_color: str):
-    rpr = run._r.get_or_add_rPr()
-    color_el = rpr.find(qn("w:color"))
-    if color_el is None:
-        color_el = OxmlElement("w:color"); rpr.append(color_el)
-    color_el.set(qn("w:val"), hex_color)
-    for attr in [qn("w:themeColor"), qn("w:themeTint"), qn("w:themeShade")]:
-        if attr in color_el.attrib:
-            del color_el.attrib[attr]
+# ── Estimation numéros de page ────────────────────────────────────────────────
+def _estimate_page_numbers(doc: Document, heading_map: dict, start_page: int = 1) -> dict:
+    """
+    Estime le numéro de page de chaque titre.
+    Compte les caractères et détecte les sauts de page explicites.
+    """
+    page_map     = {}
+    char_count   = 0
+    current_page = start_page
+
+    for i, para in enumerate(doc.paragraphs):
+        # Détecter saut de page explicite
+        has_pb = False
+        for br in para._element.iter(qn("w:br")):
+            if br.get(qn("w:type")) == "page":
+                has_pb = True
+                break
+        pPr = para._p.find(qn("w:pPr"))
+        if pPr is not None:
+            pbB = pPr.find(qn("w:pageBreakBefore"))
+            if pbB is not None and pbB.get(qn("w:val"), "true") != "false":
+                has_pb = True
+
+        if has_pb:
+            current_page += 1
+            char_count    = 0
+
+        # Enregistrer la page du titre
+        if i in heading_map:
+            page_map[i] = current_page
+
+        # Accumuler caractères
+        char_count += len(para.text) + 1
+
+        # Saut de page naturel basé sur volume
+        if char_count >= CHARS_PER_PAGE:
+            current_page += char_count // CHARS_PER_PAGE
+            char_count    = char_count % CHARS_PER_PAGE
+
+        # H1 keep_with_next — souvent en haut si proche de la fin de page
+        if heading_map.get(i) == 1 and char_count > CHARS_PER_PAGE * 0.85:
+            current_page += 1
+            char_count    = 0
+
+    return page_map
 
 
-def _force_run_formatting(run, hex_color: str, size: Pt,
-                           bold=True, italic=False, all_caps=False):
-    rpr = run._r.get_or_add_rPr()
-    rFonts = rpr.find(qn("w:rFonts"))
-    if rFonts is None:
-        rFonts = OxmlElement("w:rFonts"); rpr.insert(0, rFonts)
-    for attr in ["w:ascii", "w:hAnsi", "w:cs"]:
-        rFonts.set(qn(attr), FONT_HEAD)
-    half = str(int(size.pt * 2))
-    for tag in ["w:sz", "w:szCs"]:
-        el = rpr.find(qn(tag))
-        if el is None:
-            el = OxmlElement(tag); rpr.append(el)
-        el.set(qn("w:val"), half)
-    b = rpr.find(qn("w:b"))
-    if bold and b is None:           rpr.append(OxmlElement("w:b"))
-    elif not bold and b is not None: rpr.remove(b)
-    i_el = rpr.find(qn("w:i"))
-    if italic and i_el is None:           rpr.append(OxmlElement("w:i"))
-    elif not italic and i_el is not None: rpr.remove(i_el)
-    caps_el = rpr.find(qn("w:caps"))
-    if all_caps and caps_el is None:           rpr.append(OxmlElement("w:caps"))
-    elif not all_caps and caps_el is not None: rpr.remove(caps_el)
-    _set_run_color(run, hex_color)
-    hl = rpr.find(qn("w:highlight"))
-    if hl is not None: rpr.remove(hl)
-
-
-def _set_para_border(para, side, color_hex, sz="6"):
-    pPr  = para._p.get_or_add_pPr()
-    pBdr = OxmlElement("w:pBdr")
-    el   = OxmlElement(f"w:{side}")
-    el.set(qn("w:val"), "single"); el.set(qn("w:sz"), sz)
-    el.set(qn("w:space"), "4");    el.set(qn("w:color"), color_hex)
-    pBdr.append(el)
-    old = pPr.find(qn("w:pBdr"))
-    if old is not None: pPr.remove(old)
-    pPr.append(pBdr)
-
-
-# ── TOC manuelle ──────────────────────────────────────────────────────────────
-def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
+# ── TOC manuelle avec pages estimées ─────────────────────────────────────────
+def _add_toc_manual(doc: Document, heading_map: dict, start_page: int = 1) -> bool:
     if not heading_map:
         return False
+
+    # Estimer les numéros de page AVANT d'insérer la TOC
+    page_map = _estimate_page_numbers(doc, heading_map, start_page)
+
     toc_entries = []
     for i, para in enumerate(doc.paragraphs):
         lvl = heading_map.get(i)
         if lvl:
-            toc_entries.append({"level": min(lvl, 3), "text": para.text.strip()})
+            toc_entries.append({
+                "level": min(lvl, 3),
+                "text":  para.text.strip(),
+                "page":  page_map.get(i, start_page),
+            })
+
     if not toc_entries:
         return False
 
@@ -487,6 +438,7 @@ def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
     for entry in toc_entries:
         lvl  = entry["level"]
         text = entry["text"]
+        page = entry["page"]
         cfg  = level_cfg[lvl]
 
         toc_p   = OxmlElement("w:p")
@@ -503,6 +455,7 @@ def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
         tabs.append(tab); toc_ppr.append(tabs)
         toc_p.append(toc_ppr)
 
+        # Texte du titre
         r_text  = OxmlElement("w:r")
         r_rpr   = OxmlElement("w:rPr")
         r_sz    = OxmlElement("w:sz");    r_sz.set(qn("w:val"), cfg["font_size"])
@@ -516,17 +469,21 @@ def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
         r_t.set(qn("xml:space"), "preserve"); r_t.text = text
         r_text.append(r_t); toc_p.append(r_text)
 
+        # Tab + numéro de page estimé
         r_pg     = OxmlElement("w:r")
         r_pg_rpr = OxmlElement("w:rPr")
         r_pg_sz  = OxmlElement("w:sz");    r_pg_sz.set(qn("w:val"), cfg["font_size"])
         r_pg_col = OxmlElement("w:color"); r_pg_col.set(qn("w:val"), HEX_H3)
-        r_pg_rpr.append(r_pg_sz); r_pg_rpr.append(r_pg_col)
+        r_pg_f   = OxmlElement("w:rFonts")
+        r_pg_f.set(qn("w:ascii"), FONT_HEAD); r_pg_f.set(qn("w:hAnsi"), FONT_HEAD)
+        r_pg_rpr.append(r_pg_f); r_pg_rpr.append(r_pg_sz); r_pg_rpr.append(r_pg_col)
         r_pg.append(r_pg_rpr)
         r_pg.append(OxmlElement("w:tab"))
-        pg_t = OxmlElement("w:t"); pg_t.text = "—"
+        pg_t = OxmlElement("w:t"); pg_t.text = str(page)
         r_pg.append(pg_t); toc_p.append(r_pg)
         toc_elements.append(toc_p)
 
+    # Saut de page
     pb_p = OxmlElement("w:p")
     pb_r = OxmlElement("w:r")
     pb_e = OxmlElement("w:br"); pb_e.set(qn("w:type"), "page")
@@ -543,68 +500,99 @@ def _add_toc_manual(doc: Document, heading_map: dict) -> bool:
         for el in toc_elements:
             doc.element.body.append(el)
 
-    logger.info(f"TOC inseree — {len(toc_entries)} entrees")
+    logger.info(f"TOC inseree — {len(toc_entries)} entrees avec pages estimees")
     return True
 
 
+# ── Helpers XML ───────────────────────────────────────────────────────────────
+def _set_run_color(run, hex_color):
+    rpr = run._r.get_or_add_rPr()
+    c = rpr.find(qn("w:color"))
+    if c is None:
+        c = OxmlElement("w:color"); rpr.append(c)
+    c.set(qn("w:val"), hex_color)
+    for attr in [qn("w:themeColor"), qn("w:themeTint"), qn("w:themeShade")]:
+        if attr in c.attrib: del c.attrib[attr]
+
+
+def _force_run_formatting(run, hex_color, size, bold=True, italic=False, all_caps=False):
+    rpr = run._r.get_or_add_rPr()
+    rf = rpr.find(qn("w:rFonts"))
+    if rf is None:
+        rf = OxmlElement("w:rFonts"); rpr.insert(0, rf)
+    for a in ["w:ascii", "w:hAnsi", "w:cs"]: rf.set(qn(a), FONT_HEAD)
+    half = str(int(size.pt * 2))
+    for tag in ["w:sz", "w:szCs"]:
+        el = rpr.find(qn(tag))
+        if el is None: el = OxmlElement(tag); rpr.append(el)
+        el.set(qn("w:val"), half)
+    b = rpr.find(qn("w:b"))
+    if bold and b is None:           rpr.append(OxmlElement("w:b"))
+    elif not bold and b is not None: rpr.remove(b)
+    i_el = rpr.find(qn("w:i"))
+    if italic and i_el is None:           rpr.append(OxmlElement("w:i"))
+    elif not italic and i_el is not None: rpr.remove(i_el)
+    caps_el = rpr.find(qn("w:caps"))
+    if all_caps and caps_el is None:           rpr.append(OxmlElement("w:caps"))
+    elif not all_caps and caps_el is not None: rpr.remove(caps_el)
+    _set_run_color(run, hex_color)
+    hl = rpr.find(qn("w:highlight"))
+    if hl is not None: rpr.remove(hl)
+
+
+def _set_para_border(para, side, color_hex, sz="6"):
+    pPr  = para._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    el   = OxmlElement(f"w:{side}")
+    el.set(qn("w:val"), "single"); el.set(qn("w:sz"), sz)
+    el.set(qn("w:space"), "4");    el.set(qn("w:color"), color_hex)
+    pBdr.append(el)
+    old = pPr.find(qn("w:pBdr"))
+    if old is not None: pPr.remove(old)
+    pPr.append(pBdr)
+
+
 # ── Tableaux ──────────────────────────────────────────────────────────────────
-def _format_tables(doc: Document) -> int:
+def _format_tables(doc) -> int:
     count = 0
     for table in doc.tables:
         try:
-            _style_table(table)
+            for row_idx, row in enumerate(table.rows):
+                is_header = (row_idx == 0)
+                is_alt    = (row_idx % 2 == 0) and not is_header
+                for cell in row.cells:
+                    bg = HEX_TBL_HEAD if is_header else (HEX_TBL_ALT if is_alt else "FFFFFF")
+                    _set_cell_bg(cell, bg)
+                    _set_cell_borders(cell)
+                    for para in cell.paragraphs:
+                        para.paragraph_format.space_before = Pt(2)
+                        para.paragraph_format.space_after  = Pt(2)
+                        for run in para.runs:
+                            run.font.name = FONT_BODY
+                            run.font.size = Pt(10)
+                            run.font.bold = is_header
+                            _set_run_color(run, "FFFFFF" if is_header else HEX_BODY)
             count += 1
         except Exception as e:
             logger.warning(f"Tableau ignore: {e}")
     return count
 
 
-def _style_table(table):
-    for row_idx, row in enumerate(table.rows):
-        is_header = (row_idx == 0)
-        is_alt    = (row_idx % 2 == 0) and not is_header
-        for cell in row.cells:
-            if is_header:
-                _set_cell_background(cell, HEX_TBL_HEAD)
-            elif is_alt:
-                _set_cell_background(cell, HEX_TBL_ALT)
-            else:
-                _set_cell_background(cell, "FFFFFF")
-            _set_cell_borders(cell)
-            for para in cell.paragraphs:
-                para.paragraph_format.space_before = Pt(2)
-                para.paragraph_format.space_after  = Pt(2)
-                for run in para.runs:
-                    run.font.name = FONT_BODY
-                    run.font.size = Pt(10)
-                    if is_header:
-                        run.font.bold = True
-                        _set_run_color(run, "FFFFFF")
-                    else:
-                        run.font.bold = False
-                        _set_run_color(run, HEX_BODY)
-
-
-def _set_cell_background(cell, hex_color: str):
-    tc   = cell._tc
-    tcPr = tc.get_or_add_tcPr()
+def _set_cell_bg(cell, hex_color):
+    tcPr = cell._tc.get_or_add_tcPr()
     shd  = tcPr.find(qn("w:shd"))
-    if shd is None:
-        shd = OxmlElement("w:shd"); tcPr.append(shd)
+    if shd is None: shd = OxmlElement("w:shd"); tcPr.append(shd)
     shd.set(qn("w:val"), "clear"); shd.set(qn("w:color"), "auto")
     shd.set(qn("w:fill"), hex_color)
 
 
 def _set_cell_borders(cell):
-    tc   = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    tcBorders = tcPr.find(qn("w:tcBorders"))
-    if tcBorders is None:
-        tcBorders = OxmlElement("w:tcBorders"); tcPr.append(tcBorders)
+    tcPr = cell._tc.get_or_add_tcPr()
+    tcB  = tcPr.find(qn("w:tcBorders"))
+    if tcB is None: tcB = OxmlElement("w:tcBorders"); tcPr.append(tcB)
     for side in ["top", "left", "bottom", "right", "insideH", "insideV"]:
-        el = tcBorders.find(qn(f"w:{side}"))
-        if el is None:
-            el = OxmlElement(f"w:{side}"); tcBorders.append(el)
+        el = tcB.find(qn(f"w:{side}"))
+        if el is None: el = OxmlElement(f"w:{side}"); tcB.append(el)
         el.set(qn("w:val"), "single"); el.set(qn("w:sz"), "4")
         el.set(qn("w:space"), "0");    el.set(qn("w:color"), "BFBFBF")
 
@@ -635,14 +623,9 @@ def _fix_images(doc) -> int:
 
 
 # ── Pagination ────────────────────────────────────────────────────────────────
-def _add_pagination(doc: Document, start_page: int = 1):
-    """
-    Pied de page avec numéro de page.
-    start_page : numéro affiché sur la première page du document.
-    """
+def _add_pagination(doc, start_page=1):
     if not doc.sections:
         return
-
     for sec in doc.sections:
         sec.top_margin    = Cm(2.5)
         sec.bottom_margin = Cm(2.5)
@@ -650,33 +633,25 @@ def _add_pagination(doc: Document, start_page: int = 1):
         sec.right_margin  = Cm(2.5)
 
     section = doc.sections[-1]
-
-    # ── Numéro de page de départ ──────────────────────────────────
     if start_page != 1:
         sectPr = section._sectPr
         pgNumType = sectPr.find(qn("w:pgNumType"))
         if pgNumType is None:
-            pgNumType = OxmlElement("w:pgNumType")
-            sectPr.append(pgNumType)
+            pgNumType = OxmlElement("w:pgNumType"); sectPr.append(pgNumType)
         pgNumType.set(qn("w:start"), str(start_page))
 
-    # ── Pied de page ──────────────────────────────────────────────
     footer = section.footer
     fp = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
     fp.clear()
     fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
     _set_para_border(fp, "top", "CCCCCC", "4")
-
     r1 = fp.add_run("Page ")
     r1.font.name = FONT_BODY; r1.font.size = Pt(9)
     _set_run_color(r1, HEX_FOOTER)
-
     _add_field(fp, "PAGE")
-
     r2 = fp.add_run(" / ")
     r2.font.name = FONT_BODY; r2.font.size = Pt(9)
     _set_run_color(r2, HEX_FOOTER)
-
     _add_field(fp, "NUMPAGES")
 
 
@@ -696,7 +671,7 @@ def _add_field(para, name):
 
 
 # ── PDF ───────────────────────────────────────────────────────────────────────
-def _to_pdf(docx_path: Path, pdf_path: Path):
+def _to_pdf(docx_path, pdf_path):
     env = {**os.environ, "HOME": "/tmp", "DISPLAY": ""}
     cmd = [
         settings.LIBREOFFICE_PATH,
@@ -707,9 +682,7 @@ def _to_pdf(docx_path: Path, pdf_path: Path):
     ]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env)
-        logger.info(f"LibreOffice: {r.stdout[:200]}")
-        if r.stderr:
-            logger.warning(f"LibreOffice stderr: {r.stderr[:200]}")
+        if r.stderr: logger.warning(f"LibreOffice: {r.stderr[:200]}")
         generated = pdf_path.parent / (docx_path.stem + ".pdf")
         if generated.exists() and generated != pdf_path:
             generated.rename(pdf_path)
