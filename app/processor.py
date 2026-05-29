@@ -19,7 +19,7 @@ from docx.enum.style import WD_STYLE_TYPE
 
 from .config import settings
 from .jobs import job_store
-from .ai_service import analyze_document, AIProvider
+from .ai_service import analyze_document, estimate_page_numbers, AIProvider
 
 logger = logging.getLogger("docfix.processor")
 
@@ -86,10 +86,16 @@ async def process_document(
         logger.info(f"[{job_id}] {n_heads} titres detectes")
         _step_done(job, "headings", 44)
 
-        _step_start(job, "styles", "Application styles, couleurs et TOC...")
-        toc_ok = await asyncio.to_thread(
-            _apply_all_formatting, doc, heading_map, include_toc, start_page
-        )
+        _step_start(job, "styles", "Application styles, couleurs et TOC avec IA...")
+        # Styles + couleurs
+        await asyncio.to_thread(_setup_styles, doc)
+        await asyncio.to_thread(_apply_heading_styles_with_map, doc, heading_map)
+        # TOC avec pages estimées via IA
+        if include_toc:
+            page_map = await estimate_page_numbers(doc, heading_map, start_page, job_id)
+            toc_ok   = await asyncio.to_thread(_add_toc_with_pages, doc, heading_map, page_map)
+        else:
+            toc_ok = False
         _step_done(job, "styles", 54)
 
         job.set_step_done("toc")
@@ -698,3 +704,129 @@ def _to_pdf(docx_path, pdf_path):
 def _count_pages(doc) -> int:
     total = sum(max(1, len(p.text) // 80) for p in doc.paragraphs if p.text.strip())
     return max(1, total // 40)
+
+# ── Patch v2.1 : remplace _apply_all_formatting pour utiliser estimate_page_numbers ──
+# Cette version async appelle l'IA pour les pages
+async def _apply_all_formatting_async(
+    doc: Document,
+    heading_map: dict,
+    include_toc: bool,
+    start_page: int,
+    job_id: str,
+) -> bool:
+    """Version async qui appelle l'IA pour estimer les pages."""
+    _setup_styles(doc)
+    _apply_heading_styles_with_map(doc, heading_map)
+    if not include_toc:
+        return False
+    # Estimer les pages via IA (ou fallback math)
+    page_map = await estimate_page_numbers(doc, heading_map, start_page, job_id)
+    return _add_toc_with_pages(doc, heading_map, page_map)
+
+
+def _add_toc_with_pages(doc: Document, heading_map: dict, page_map: dict) -> bool:
+    """Insère la TOC avec les numéros de page fournis."""
+    if not heading_map:
+        return False
+
+    toc_entries = []
+    for i, para in enumerate(doc.paragraphs):
+        lvl = heading_map.get(i)
+        if lvl:
+            toc_entries.append({
+                "level": min(lvl, 3),
+                "text":  para.text.strip(),
+                "page":  page_map.get(i, 1),
+            })
+
+    if not toc_entries:
+        return False
+
+    first = next((p for p in doc.paragraphs if p.text.strip()), None)
+    toc_elements = []
+
+    # Titre
+    title_p   = OxmlElement("w:p")
+    title_ppr = OxmlElement("w:pPr")
+    jc = OxmlElement("w:jc"); jc.set(qn("w:val"), "center")
+    sp = OxmlElement("w:spacing")
+    sp.set(qn("w:before"), "480"); sp.set(qn("w:after"), "360")
+    pBdr = OxmlElement("w:pBdr")
+    bot  = OxmlElement("w:bottom")
+    bot.set(qn("w:val"), "single"); bot.set(qn("w:sz"), "8")
+    bot.set(qn("w:space"), "4");    bot.set(qn("w:color"), HEX_H1)
+    pBdr.append(bot)
+    title_ppr.append(jc); title_ppr.append(sp); title_ppr.append(pBdr)
+    title_p.append(title_ppr)
+    title_r   = OxmlElement("w:r")
+    title_rpr = OxmlElement("w:rPr")
+    for tag, val in [("w:b",None),("w:caps",None),("w:sz","32"),("w:color",HEX_H1)]:
+        el = OxmlElement(tag)
+        if val: el.set(qn("w:val"), val)
+        title_rpr.append(el)
+    rf = OxmlElement("w:rFonts")
+    rf.set(qn("w:ascii"), FONT_HEAD); rf.set(qn("w:hAnsi"), FONT_HEAD)
+    title_rpr.append(rf)
+    title_r.append(title_rpr)
+    title_t = OxmlElement("w:t"); title_t.text = "Table des matieres"
+    title_r.append(title_t); title_p.append(title_r)
+    toc_elements.append(title_p)
+
+    level_cfg = {
+        1: {"indent":"0",   "font_size":"22","bold":True,  "color":HEX_H1,"before":"120","after":"60"},
+        2: {"indent":"360", "font_size":"20","bold":False, "color":HEX_H2,"before":"60", "after":"40"},
+        3: {"indent":"720", "font_size":"18","bold":False, "color":HEX_H3,"before":"40", "after":"20"},
+    }
+
+    for entry in toc_entries:
+        lvl  = entry["level"]; text = entry["text"]; page = entry["page"]
+        cfg  = level_cfg[lvl]
+        toc_p = OxmlElement("w:p")
+        toc_ppr = OxmlElement("w:pPr")
+        ind = OxmlElement("w:ind"); ind.set(qn("w:left"), cfg["indent"])
+        toc_ppr.append(ind)
+        sp2 = OxmlElement("w:spacing")
+        sp2.set(qn("w:before"), cfg["before"]); sp2.set(qn("w:after"), cfg["after"])
+        toc_ppr.append(sp2)
+        tabs = OxmlElement("w:tabs")
+        tab  = OxmlElement("w:tab")
+        tab.set(qn("w:val"),"right"); tab.set(qn("w:leader"),"dot"); tab.set(qn("w:pos"),"8640")
+        tabs.append(tab); toc_ppr.append(tabs)
+        toc_p.append(toc_ppr)
+        r_text = OxmlElement("w:r")
+        r_rpr  = OxmlElement("w:rPr")
+        r_sz   = OxmlElement("w:sz");    r_sz.set(qn("w:val"), cfg["font_size"])
+        r_col  = OxmlElement("w:color"); r_col.set(qn("w:val"), cfg["color"])
+        r_f    = OxmlElement("w:rFonts")
+        r_f.set(qn("w:ascii"),FONT_HEAD); r_f.set(qn("w:hAnsi"),FONT_HEAD)
+        r_rpr.append(r_f); r_rpr.append(r_sz); r_rpr.append(r_col)
+        if cfg["bold"]: r_rpr.append(OxmlElement("w:b"))
+        r_text.append(r_rpr)
+        r_t = OxmlElement("w:t")
+        r_t.set(qn("xml:space"),"preserve"); r_t.text = text
+        r_text.append(r_t); toc_p.append(r_text)
+        r_pg = OxmlElement("w:r")
+        r_pg_rpr = OxmlElement("w:rPr")
+        r_pg_sz  = OxmlElement("w:sz");    r_pg_sz.set(qn("w:val"), cfg["font_size"])
+        r_pg_col = OxmlElement("w:color"); r_pg_col.set(qn("w:val"), HEX_H3)
+        r_pg_f   = OxmlElement("w:rFonts")
+        r_pg_f.set(qn("w:ascii"),FONT_HEAD); r_pg_f.set(qn("w:hAnsi"),FONT_HEAD)
+        r_pg_rpr.append(r_pg_f); r_pg_rpr.append(r_pg_sz); r_pg_rpr.append(r_pg_col)
+        r_pg.append(r_pg_rpr)
+        r_pg.append(OxmlElement("w:tab"))
+        pg_t = OxmlElement("w:t"); pg_t.text = str(page)
+        r_pg.append(pg_t); toc_p.append(r_pg)
+        toc_elements.append(toc_p)
+
+    pb_p = OxmlElement("w:p"); pb_r = OxmlElement("w:r")
+    pb_e = OxmlElement("w:br"); pb_e.set(qn("w:type"),"page")
+    pb_r.append(pb_e); pb_p.append(pb_r); toc_elements.append(pb_p)
+
+    if first is not None:
+        ref = first._element; par = ref.getparent(); idx = list(par).index(ref)
+        for el in reversed(toc_elements): par.insert(idx, el)
+    else:
+        for el in toc_elements: doc.element.body.append(el)
+
+    logger.info(f"TOC inseree — {len(toc_entries)} entrees avec pages IA")
+    return True
